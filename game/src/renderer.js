@@ -5,7 +5,7 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
-import { RENDER } from './config.js';
+import { RENDER, CAMERA } from './config.js';
 
 export function hasWebGL() {
   try {
@@ -37,14 +37,17 @@ export function detectGpu() {
 }
 
 export class Renderer {
-  constructor(container, settings) {
+  constructor(container, settings, { mobile = false } = {}) {
+    this.mobile = mobile; // 16차 3-4: 터치 기기 프로필(MSAA 0)
+    this.scale = 1; // 16차 L3: 해상도 조절기 배율(0.75~1.0)
+    this.container = container;
     this.settings = settings;
     // 가속 꺼짐이면 저사양을 자동으로 켠다(블룸 끔·불씨 절반·MSAA 0·내부 해상도 가로 1280 이하). 저장은 하지 않는다.
     const gpu = detectGpu();
     this.gpuName = gpu.name;
     this.software = gpu.software;
     if (this.software) settings.lowSpec = true;
-    this.renderer = new THREE.WebGLRenderer({ antialias: !this.software, powerPreference: 'high-performance' });
+    this.renderer = new THREE.WebGLRenderer({ antialias: !this.software && !mobile, powerPreference: 'high-performance' });
     this.renderer.toneMapping = TONE[RENDER.toneMapping] ?? THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = RENDER.exposure;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -54,7 +57,7 @@ export class Renderer {
     this.canvas = this.renderer.domElement;
 
     // HDR(반정밀 실수) + 여러 번 표본(계단 현상 줄이기) 렌더 타깃
-    const rt = new THREE.WebGLRenderTarget(256, 256, { type: THREE.HalfFloatType, samples: this.software ? 0 : RENDER.msaaSamples });
+    const rt = new THREE.WebGLRenderTarget(256, 256, { type: THREE.HalfFloatType, samples: this.software || mobile ? 0 : RENDER.msaaSamples });
     this.composer = new EffectComposer(this.renderer, rt);
     this.renderPass = new RenderPass(new THREE.Scene(), new THREE.PerspectiveCamera());
     // UnrealBloomPass 는 내부 계산을 화면의 절반 해상도에서 시작한다(성능).
@@ -79,12 +82,20 @@ export class Renderer {
     let pr = Math.min(window.devicePixelRatio || 1, cap);
     // 소프트웨어 그리기 + 저사양: 내부 해상도 가로를 1280 이하로
     if (this.software && this.settings.lowSpec) pr = Math.min(pr, RENDER.softwareMaxWidth / Math.max(1, window.innerWidth));
-    return pr;
+    return pr * this.scale;
   }
 
   resize() {
     const w = window.innerWidth;
-    const h = window.innerHeight;
+    const H = window.innerHeight;
+    // 16차 3-2: 가로세로비가 1.30 미만이면 위아래 검은 띠(3D 화면만, 글 화면은 전체)
+    const h = Math.min(H, Math.round(w / CAMERA.fit.minAspect));
+    this.viewTop = Math.floor((H - h) / 2);
+    if (this.container && this.container.style) {
+      this.container.style.top = h < H ? `${this.viewTop}px` : '';
+      this.container.style.bottom = h < H ? 'auto' : '';
+      this.container.style.height = h < H ? `${h}px` : '';
+    }
     const pr = this.pixelRatio;
     this.renderer.setPixelRatio(pr);
     this.renderer.setSize(w, h);
@@ -92,7 +103,17 @@ export class Renderer {
     this.composer.setSize(w, h);
     this.width = w;
     this.height = h;
+    this.viewH = h;
     for (const fn of this.onResize) fn(w, h, pr);
+  }
+
+  // 16차 L3: 해상도 조절기 배율 바꾸기(0.75~1.0)
+  setScale(s) {
+    const v = Math.round(Math.min(RENDER.res.max, Math.max(RENDER.res.min, s)) * 100) / 100;
+    if (v === this.scale) return false;
+    this.scale = v;
+    this.resize();
+    return true;
   }
 
   // 블룸을 쓰면 후처리 경로, 아니면 바로 그린다(이때는 재질마다 톤매핑).

@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite --port 5173 --strictPort",
     "build": "vite build",
-    "preview": "vite preview --port 4173 --strictPort"
+    "preview": "vite preview --port 4173 --strictPort",
+    "harness": "node tools/harness/run.mjs",
+    "test:ranking": "node tools/ranking-test.mjs",
+    "test:lines": "node tools/lines-test.mjs"
   },
   "dependencies": {
     "three": "0.186.1"

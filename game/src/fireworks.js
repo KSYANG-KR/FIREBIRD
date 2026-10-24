@@ -91,7 +91,7 @@ export class Fireworks {
   }
 
   setStage(stage) {
-    this.palette = stage.palette || FALLBACK; // 4차: 위협·장식 모두 스테이지 팔레트 하나(「한 쇼」)
+    this.palette = (stage.city && stage.city.palette) || FALLBACK; // 4차: 위협·장식 모두 스테이지 팔레트 하나(「한 쇼」)
   }
 
   setLowSpec(low) {
@@ -101,19 +101,20 @@ export class Fireworks {
     this.sparks.limit = Math.floor((RENDER.particlePool + THREAT.pool) * this.emitMult);
   }
 
-  setPointScale(v, vw, vh) {
+  // 16차 3-4: 모바일은 불씨·연기 최대 픽셀을 절반(maxSpark·maxSmoke 를 넘겨받음)
+  setPointScale(v, vw, vh, maxSpark = RENDER.maxSparkPx, maxSmoke = RENDER.maxSmokePx) {
     this.sparks.setScale(v, vw, vh);
     this.smoke.setScale(v, vw, vh);
     // 불씨·연기 최대 픽셀은 1080p 기준값을 해상도에 비례해서
-    this.sparks.setScaleMax(RENDER.maxSparkPx * (vh / 1080));
-    this.smoke.setScaleMax(RENDER.maxSmokePx * (vh / 1080));
+    this.sparks.setScaleMax(maxSpark * (vh / 1080));
+    this.smoke.setScaleMax(maxSmoke * (vh / 1080));
   }
 
   // 장식 불꽃(판정 없음) 한 발 — 거리대 band(near 55~150 / mid 150~300 / far 300~900m, 카메라에서).
   // 눈에 보이는 실제 발사대(바지선·옥상)에서 쏘고, 비행 단면 경계에서 8m 이상 바깥에서 터지며 불씨가 단면에 닿지 않게 둔다.
   // ctx: { camera, course, world, camS, color }. 놓았으면 true
   spawnDecorBand(band, t, ctx, opts = {}) {
-    if (this.bandAlive(band.id, t) >= band.max) return false;
+    if (this.bandAlive(band.id, t) >= Math.min(band.max, this.decorMax ?? Infinity)) return false; // 16차: 모바일은 거리대마다 2
     const { camera, course, world } = ctx;
     const C = camera.position;
     camera.getWorldDirection(this._v);
@@ -144,8 +145,21 @@ export class Fireworks {
       // 발사대가 단면 바로 아래면 발사 꼬리가 단면을 지나므로 버린다
       if (Math.abs(n.u) < s0.u + DECOR.margin && n.s > (ctx.camS || 0) - 20) continue;
       const lateral = Math.abs(n.u) - s0.u - visR * 1.08 - 5 >= DECOR.margin;
-      let y = base.y + rand(22, 55) * (band.id === 'far' ? 1.8 : band.id === 'mid' ? 1.3 : 1);
+      // 15차 A-6: 장식 폭발 높이 = max(발사대 + 오르는 높이, 반경 30m 안 지붕 최고 + visR + 10, 카메라 높이 + 띠별 값)
+      //   near 의 25% 는 「옥상 소형 연발」(지붕 + 8~15m, 새보다 아래, 통로 옆 margin 밖 — lateral 일 때만)
+      const roof = world && world.roofMax ? Math.max(base.y, world.roofMax(base.x, base.z, 30)) : base.y;
+      const off = DECOR.camAbove[band.id] || [5, 25];
+      const salvo = band.id === 'near' && lateral && L && Math.random() < DECOR.salvo;
+      let y;
+      if (salvo) y = roof + rand(8, 15);
+      else {
+        y = base.y + rand(22, 55) * (band.id === 'far' ? 1.8 : band.id === 'mid' ? 1.3 : 1);
+        y = Math.max(y, roof + visR + 10, C.y + rand(off[0], off[1]));
+      }
       if (!lateral) y = Math.max(y, s0.v1 + DECOR.margin + visR * 1.08 + drop + rand(0, 10));
+      this.log.roofN = (this.log.roofN || 0) + 1;
+      if (y >= roof + 8) this.log.roofOk = (this.log.roofOk || 0) + 1;
+      if (salvo) this.log.salvo = (this.log.salvo || 0) + 1;
       const p = new THREE.Vector3(base.x + rand(-4, 4), y, base.z + rand(-4, 4));
       const d3 = p.distanceTo(C);
       if (d3 < band.dist[0] * 0.95 || d3 > band.dist[1] * 1.05) continue;

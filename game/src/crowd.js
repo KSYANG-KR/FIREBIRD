@@ -4,6 +4,7 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 import { CROWD } from './config.js';
 
 const MAX_BURSTS = 8;
+const _dir = new THREE.Vector3();
 const SHOULDER = 1.35;
 
 function part(sx, sy, sz, x, y, z, arm, head) {
@@ -27,7 +28,7 @@ function personGeometry() {
 
 const VERT = /* glsl */ `
 attribute vec4 aInst;   // x, z: 세계 위치, y: 바라보는 방향(라디안), w: 위상
-attribute vec2 aMisc;   // x: 키 배율, y: 휴대폰 불빛 여부
+attribute vec3 aMisc;   // x: 키 배율, y: 휴대폰 불빛 여부, z: 바닥 높이(16차 U7 옥상 테라스, 보통 0)
 attribute float aArm;
 attribute float aHead;
 uniform float uTime;
@@ -41,7 +42,7 @@ varying float vPhone;
 varying float vFogDepth;
 varying float vShade;
 void main() {
-  vec3 base = vec3(aInst.x, uGroundY, aInst.z);
+  vec3 base = vec3(aInst.x, uGroundY + aMisc.z, aInst.z);
   float cy = cos(aInst.y), sy = sin(aInst.y);
 
   float cheer = 0.0;
@@ -121,10 +122,12 @@ export class Crowd {
     });
     this.mesh = null;
     this.burstCursor = 0;
+    this.R = 280; // 카메라에서 이 거리 안 사람만 그린다(16차 U10: 스테이지 city.crowdR — S5 220, 나머지 280 그대로)
   }
 
   // spots: [x, z, 무작위, …] (world.crowdSpots). count: 사람 수(자리보다 많으면 자리 수)
-  build(spots, groundY, count = 1500) {
+  // 16차 U7: ys = 자리마다 바닥 높이(옥상 테라스 — S2). 없으면 모두 groundY(난수 부르는 순서는 그대로)
+  build(spots, groundY, count = 1500, ys = null) {
     if (this.mesh) {
       this.scene.remove(this.mesh);
       this.mesh.geometry.dispose();
@@ -133,18 +136,19 @@ export class Crowd {
     const n = Math.max(1, Math.min(total, count));
     const geo = this.geo.clone();
     const inst = new Float32Array(n * 4);
-    const misc = new Float32Array(n * 2);
+    const misc = new Float32Array(n * 3);
     for (let i = 0; i < n; i++) {
       const j = Math.floor((i / n) * total) * 3;
       inst[i * 4] = spots[j] + (Math.random() - 0.5) * 0.4;
       inst[i * 4 + 1] = Math.random() * Math.PI * 2;
       inst[i * 4 + 2] = spots[j + 1] + (Math.random() - 0.5) * 0.4;
       inst[i * 4 + 3] = spots[j + 2];
-      misc[i * 2] = 0.85 + Math.random() * 0.3;
-      misc[i * 2 + 1] = Math.random() < 0.12 ? 1 : 0;
+      misc[i * 3] = 0.85 + Math.random() * 0.3;
+      misc[i * 3 + 1] = Math.random() < 0.12 ? 1 : 0;
+      misc[i * 3 + 2] = ys ? ys[j / 3] || 0 : 0;
     }
     geo.setAttribute('aInst', new THREE.InstancedBufferAttribute(inst, 4));
-    geo.setAttribute('aMisc', new THREE.InstancedBufferAttribute(misc, 2));
+    geo.setAttribute('aMisc', new THREE.InstancedBufferAttribute(misc, 3));
     this.mesh = new THREE.InstancedMesh(geo, this.material, n);
     this.mesh.frustumCulled = false;
     // 12차: 180초 코스(둑이 2배 넘게 길어짐) — 카메라 280m 안 사람만 앞으로 모아 그린다(삼각형 절약)
@@ -180,16 +184,23 @@ export class Crowd {
     this.material.uniforms.uTime.value = time;
     if (cam && this.mesh && this.master) {
       const x = cam.position.x, z = cam.position.z;
-      if (this._last && Math.hypot(x - this._last[0], z - this._last[1]) < 30) return;
-      this._last = [x, z];
+      // 16차 3-4 모바일(view): 카메라 앞 부채꼴(±75°, 40m 안은 모두)만 — 방향이 15° 넘게 돌아도 다시 모은다
+      const V = this.view;
+      let fx = 0, fz = -1;
+      if (V) { cam.getWorldDirection(_dir); const L = Math.hypot(_dir.x, _dir.z) || 1; fx = _dir.x / L; fz = _dir.z / L; }
+      const turned = V && this._last && fx * this._last[2] + fz * this._last[3] < V.turnCos;
+      if (!turned && this._last && Math.hypot(x - this._last[0], z - this._last[1]) < 30) return;
+      this._last = [x, z, fx, fz];
       const [mi, mm] = this.master;
       const [ai, am] = this.attrs;
       let k = 0;
       for (let i = 0; i < this.nAll; i++) {
         const dx = mi[i * 4] - x, dz = mi[i * 4 + 2] - z;
-        if (dx * dx + dz * dz > 280 * 280) continue;
+        const d2 = dx * dx + dz * dz;
+        if (d2 > this.R * this.R) continue;
+        if (V && d2 > 1600 && dx * fx + dz * fz < V.cos * Math.sqrt(d2)) continue;
         for (let q = 0; q < 4; q++) ai.array[k * 4 + q] = mi[i * 4 + q];
-        am.array[k * 2] = mm[i * 2]; am.array[k * 2 + 1] = mm[i * 2 + 1];
+        am.array[k * 3] = mm[i * 3]; am.array[k * 3 + 1] = mm[i * 3 + 1]; am.array[k * 3 + 2] = mm[i * 3 + 2];
         k++;
       }
       this.mesh.count = k;

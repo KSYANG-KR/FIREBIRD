@@ -1,60 +1,64 @@
-# Birds vs Fireworks
+# Firework Survival
 
-사람에게는 축제, 새에게는 악몽. 서울풍 가상 도시의 불꽃축제 한가운데서 잠이 깬 새가 되어, 강 위에서 시작해 도심 빌딩 협곡·옥상 위를 돌아 다시 강으로 내려오며, 눈앞에서 터지는 불꽃 사이를 빠져나가는 3D 웹 게임입니다.
+Fun for people. A nightmare for birds.
+You are a bird asleep on a bridge in a Seoul-like city. The fireworks festival starts, and the noise sends you into the night sky.
+Fly just above the rooftops, along the river, over downtown and back to the river, and dodge the fireworks bursting right in front of you.
 
-**플레이(공개 후 주소):** https://<아이디>.github.io/bird-vs-fireworks/
-(PC 크롬·엣지 권장, 키보드 전용)
+**Play (after publishing):** https://<id>.github.io/bird-vs-fireworks/
+(PC Chrome or Edge recommended, keyboard only)
 
-## 게임 소개
+## How to play
 
-- 참새(회피형)·까치(균형형)·비둘기(맷집형) 중 하나를 고릅니다.
-- 지금은 STAGE 1 「강과 도심」(약 180초, 120BPM 배경음악)만 열려 있습니다. STAGE 2~5 는 「준비 중」입니다.
-- 코스: 강 위 다리 밑 → 좌 90° 선회(쉬는 구간) → 대로·빌딩 협곡·상승 → 옥상 위 우 120° 선회(쉬는 구간) → 강으로 하강 → 다리 밑 숨 고르기(쉬는 구간) → 피날레. 쉬는 구간에 들어갈 때마다 롤 +1.
-- **불꽃이 올라가면 바로 점선 범위 원이 뜨고 약 1초 뒤 쾅! 원 밖으로, 또는 가운데 구멍으로.**
-  - 보이는 범위가 곧 판정 범위입니다. 띠 모양 불꽃은 바깥 원과 구멍 원 두 줄, 원판 모양 불꽃은 바깥 원 + 옅은 채움(그 안은 모두 위험).
-  - 피하는 길 둘: ① 범위 원 밖으로(통과 50점 × 배율) ② 가운데 구멍으로(센터 200점 × 배율, 배율 +0.15). 구멍이 있는 불꽃이면 「지금 내 새 자리」에 하얀 작은 점선 고리(조준점)가 떠서 구멍을 겨눌 수 있습니다.
-  - 종류: 국화 · 버드나무(금빛, 길게 흘러내림) · 고리(얇은 띠, 넓은 구멍) · 모란(원판) · 심 모란(원판). 가만히 있으면 반드시 맞습니다.
-- 위험은 색이 아니라 모양·밝기로 구분합니다(흰빛 머리 + 흔들림 없는 실선 줄기 = 위험). 통로 밖 하늘의 반짝이는 불꽃은 구경거리입니다.
-- 먹이 두 가지
-  - **HP 먹이**: 새가 좋아하는 먹이(참새 곡식 · 까치 나방 · 비둘기 빵)에 민트 빛무리와 「+」 고리. 불꽃 머리 바로 바깥에 있어 타이밍을 맞춰야 먹습니다. HP 가 가득이면 +100점.
-  - **롤 먹이**: 천천히 도는 시안 깃털. 먹으면 롤 +1(최대 5), 롤이 가득이면 +200점.
-- 랭킹은 이 브라우저에만 저장되는 「캐주얼 랭킹」입니다.
+- Choose a bird: Sparrow (quick & tiny), Magpie (all-rounder) or Pigeon (tough).
+- One stage, about 180 seconds: river → left turn → avenue and downtown rooftops → rooftop turn → down to the river → over Bridge B → finale.
+- **When a firework goes up, a dotted ring appears. About one second later it bursts. Fly outside the ring — or through the hole.**
+  - The ring you see is exactly the danger area.
+  - Outside the ring: PASS. Through the hole: THROUGH! (more points).
+  - Small dotted ring = where you are, drawn on the burst plane (only for fireworks with a hole).
+- Food: mint-ringed food heals HP. Cyan feathers give ROLL +1 (max 5). When full, you get points instead.
+- Top 10 is saved only in this browser.
 
-## 조작 (PC 키보드 전용)
+## Controls (keyboard only)
 
-| 키 | 동작 |
+| Key | Action |
 | --- | --- |
-| 방향키 / WASD | 옆·위아래 이동(앞으로는 자동). 점선 범위 원 밖으로, 또는 가운데 구멍으로(하얀 작은 고리 = 내 새가 지날 자리) |
-| Space | 급회피 롤 — 개수제(시작 3개 · 최대 5개, 화면 아래 ◆◆◆◇◇ 표시). 누른 방향으로 2m, 0개면 「턱」 소리만 납니다 |
-| Esc / P | 일시정지 |
-| M | 소리 끄기·켜기 |
+| Arrow keys / WASD | Move (you fly forward automatically) |
+| Space | Roll (start with 3, max 5) |
+| Esc / P | Pause |
+| M | Sound on/off |
 
-## 광과민성 경고
+## Photosensitivity warning
 
-불꽃의 빛과 밝기 변화가 나옵니다. 빛에 민감하거나 발작을 겪은 적이 있다면 플레이하지 마세요.
-화면 전체가 하얗게 번쩍이는 연출은 넣지 않았고, 화면 밝기 급변은 1초에 3회 이하로 제한합니다.
-시작 화면의 「흔들림 줄이기」를 켜면 화면 기울기·시야 튐·피격·폭발 흔들림·슬로모가 꺼집니다(운영체제의 「애니메이션 줄이기」가 켜져 있으면 처음부터 켜짐). 시야각 변화는 모두 합쳐 5° 이하입니다.
+Warning: flashing lights. If you have photosensitive epilepsy, don't play. Stop if you feel unwell.
+There is no full-screen white flash, and big brightness changes are limited to 3 per second.
+"Reduce Motion" turns off screen tilt, FOV kicks, shakes and slow motion (on by default if your OS asks for reduced motion).
 
-## 그래픽 가속이 꺼져 있으면
+## If hardware acceleration is off
 
-브라우저가 그래픽 카드를 쓰지 않으면(크롬 「가능한 경우 그래픽 가속 사용」 꺼짐) 시작 화면에 안내 띠가 뜨고 품질을 자동으로 낮춥니다. 크롬 설정 → 시스템에서 켜고 다시 시작하거나, 엣지로 여세요.
+The game shows a notice and lowers quality. Turn it on at chrome://settings/system and restart Chrome, or use Edge.
 
-## 크레딧
+## Credits
 
-- 코드: three.js(3D) + Vite. 소리·배경음악은 Web Audio 합성, 불꽃·도시는 코드로 만든 도형과 셰이더입니다. 실존 랜드마크·실제 상호는 없습니다.
-- 외부 에셋: 건물 외벽 · 아스팔트 · 보도블록(ambientCG, CC0 1.0), 연기(Kenney, CC0 1.0), 간판 폰트 BvfSign(Black Han Sans 서브셋, SIL OFL 1.1).
-- **AI 생성 에셋:** 새 3D 모델 3종과 창 안 실내·원경 스카이라인 그림은 AI 도구(Higgsfield: GPT Image, Meshy)로 생성한 뒤 가공했습니다. 이 AI 생성 에셋은 이 저장소 코드의 라이선스에 포함되지 않습니다.
-- 자세한 출처·라이선스: [`public/assets/CREDITS.txt`](public/assets/CREDITS.txt)
+- Code: three.js + Vite. Sound and music are synthesized with Web Audio. Fireworks and the city are code-made shapes and shaders. No real landmarks or real shop names.
+- Third-party assets: facades, asphalt, paving (ambientCG, CC0 1.0), smoke (Kenney, CC0 1.0), sign font BvfSign (Black Han Sans subset, SIL OFL 1.1), title font Anton (SIL OFL 1.1, full text in `public/assets/fonts/OFL.txt`).
+- **AI-generated assets:** the three bird 3D models and the window-interior / skyline images were made with AI tools (Higgsfield: GPT Image, Meshy) and then edited. They are NOT covered by the license of the code in this repository.
+- Details: [`public/assets/CREDITS.txt`](public/assets/CREDITS.txt)
 
-## 로컬에서 실행하기
+## Run locally
 
-[Node.js](https://nodejs.org) 가 필요합니다. 이 저장소 폴더에서:
+Needs [Node.js](https://nodejs.org). In this folder:
 
 ```
-npm install      # 처음 한 번
+npm install      # once
 npm run dev      # http://localhost:5173
 ```
 
-- 공개용으로 묶기: `npm run build` (결과는 `docs/`), 묶은 결과 확인: `npm run preview` (http://localhost:4173)
-- 윈도우 파워셸에서 `npm` 이 실행 정책에 막히면 `npm.cmd` 로 바꿔 쓰세요.
-- 균형 수치는 `src/config.js` 에 모여 있습니다.
+- Build for publishing: `npm run build` (output in `docs/`). Preview the build: `npm run preview` (http://localhost:4173)
+- On Windows PowerShell, if `npm` is blocked, use `npm.cmd`.
+- Balance numbers live in `src/config.js`.
+
+## 한국어 안내
+
+- 게임 이름은 「파이어워크 서바이벌(Firework Survival)」이고, 화면 글자는 모두 영어입니다. 배경의 한글 간판은 서울 밤거리 그림이라 그대로 둡니다.
+- 조작: 방향키/WASD 이동, Space 롤, Esc 일시정지, M 소리. 점선 원이 뜨면 약 1초 뒤 터지니 원 밖으로, 또는 가운데 구멍으로 피하세요.
+- 광과민성 경고: 불꽃의 빛과 밝기 변화가 나옵니다. 빛에 민감하거나 발작을 겪은 적이 있다면 플레이하지 마세요.

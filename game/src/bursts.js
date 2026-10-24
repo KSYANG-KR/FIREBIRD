@@ -7,7 +7,7 @@
 // - 일생: 발사(폭발 1.0/0.95/0.9초 전) → 0.1초 뒤 범위 원(omens.js) → 폭발 0.45초 전 알 → 폭발 → 새 도착(+0.5/0.45/0.4초).
 // - 지나간 불꽃: 「새」가 면을 지나고 0.1초 뒤부터 0.25초 동안 25% 로. 카메라 10m 안 별은 밝기 ×0.5, 화면 크기 상한.
 import * as THREE from 'three';
-import { BURST, BAND, COURSE, ROLL, OMEN, SCORING, DAMAGE, THREAT, TIMING } from './config.js';
+import { BURST, BAND, ELLIPSE, ROLL, OMEN, SCORING, DAMAGE, THREAT, TIMING } from './config.js';
 import { ParticleSystem, FLAG_FLICKER, FLAG_TAIL, FLAG_TRAIL, emitGlitter } from './particles.js';
 import { Omens } from './omens.js';
 import { CGRID, safeGrid, sideMargin, pathOfOne, clrRho, dropJ } from './choreo.js';
@@ -15,7 +15,7 @@ import { CGRID, safeGrid, sideMargin, pathOfOne, clrRho, dropJ } from './choreo.
 const rand = (a, b) => a + Math.random() * (b - a);
 const randi = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
 const DEG = Math.PI / 180;
-const E = COURSE.ellipse;
+const E = ELLIPSE; // 16차 U6a: 이동 타원은 모든 스테이지 공통
 
 function segDist(px, py, pz, ax, ay, az, bx, by, bz) {
   const dx = bx - ax, dy = by - ay, dz = bz - az;
@@ -43,6 +43,7 @@ attribute vec3 aQ;  // 꼬리 색 rgb(HDR, 흰빛 시작 없이 그 불꽃 색)
 uniform float uScale;
 uniform vec2 uViewport;
 uniform float uMaxPx;
+uniform float uHeadMin; // 16차 3-4: 머리 최소 반지름(장치 화소, 모바일 = 화면 지름 3 CSS px). 0 이면 없음
 uniform vec3 uNear;
 uniform vec4 uNearCam;
 varying vec3 vC;
@@ -93,6 +94,7 @@ void main() {
     float px = rad * uScale / d;
     if (d < uNearCam.y && px > uNearCam.w * 0.5) px = uNearCam.w * 0.5;
     if (px < 0.9) { a *= px * px / 0.81; px = 0.9; }
+    if (!tip) px = max(px, uHeadMin);
     px = min(px, uMaxPx);
     vec4 c = projectionMatrix * mv;
     c.xy += position.xy * ext * px / hv * c.w;
@@ -218,7 +220,7 @@ class StarRenderer {
       vertexShader: STAR_VERT,
       fragmentShader: STAR_FRAG,
       uniforms: {
-        uScale: { value: 500 }, uViewport: { value: new THREE.Vector2(1280, 720) }, uMaxPx: { value: 60 }, uNear: { value: new THREE.Vector3(1.5, 4.5, 0.05) }, uNearCam: { value: new THREE.Vector4(8, 10, 0.5, 30) },
+        uScale: { value: 500 }, uViewport: { value: new THREE.Vector2(1280, 720) }, uMaxPx: { value: 60 }, uNear: { value: new THREE.Vector3(1.5, 4.5, 0.05) }, uNearCam: { value: new THREE.Vector4(8, 10, 0.5, 30) }, uHeadMin: { value: 0 },
         uTime: { value: 0 },
       },
       transparent: true,
@@ -296,7 +298,7 @@ export class Bursts {
     this.course = null;
     this.world = null;
     this.debug = false;
-    this.stars = new StarRenderer(7000);
+    this.stars = new StarRenderer(9000); // 16차 U7: palm(채움 별 약 480개)이 겹치는 피날레에 맞춰 7000 → 9000
     this.root.add(this.stars.mesh);
     this.sparks = new ParticleSystem(THREAT.pool, { kind: 'spark' }); // 10차: 위협 장식 풀(게임에서는 장식 불꽃 입자계와 함께 씀 — useSparks)
     this.sparks.mesh.renderOrder = 7;
@@ -345,7 +347,8 @@ export class Bursts {
     this.sharedSparks = true;
   }
 
-  setPointScale(v, vw, vh, maxPx) {
+  // vis(16차 3-4, 모바일): { headMin: 별 머리 최소 반지름, lineMin: 범위 원 선 최소 반폭 } — 장치 화소
+  setPointScale(v, vw, vh, maxPx, vis = null) {
     if (!this.sharedSparks) {
       this.sparks.setScale(v, vw, vh);
       this.sparks.setScaleMax(maxPx);
@@ -356,7 +359,8 @@ export class Bursts {
     u.uMaxPx.value = 60 * (vh / 1080);
     const N = BURST.nearCam;
     u.uNearCam.value.set(N.from, N.dist, N.mult, (N.capM * v) / N.dist);
-    this.omens.setScale(v, vh, vw);
+    u.uHeadMin.value = vis ? vis.headMin : 0;
+    this.omens.setScale(v, vh, vw, vis ? vis.lineMin : 0.75);
   }
 
   static rb(bird) {
@@ -511,9 +515,9 @@ export class Bursts {
     sh.lam = egg.shape === 'band' ? 1 - egg.rin / egg.rout : 1;
     sh.hole = egg.shape === 'band';
     sh.tDrop = sh.tMeet - sh.tBurst + BURST.judgeAfter;
-    sh.gAfter = dr(BAND.gAfter[0], BAND.gAfter[1]) * (K.look === 'willow' ? 1.25 : 1);
+    sh.gAfter = dr(BAND.gAfter[0], BAND.gAfter[1]) * (K.look === 'willow' ? 1.25 : K.gAfterMult || 1); // 16차 U8: kamuro 판정 뒤 처짐 × 1.45(판정 시간은 그대로)
     sh.look = K.look;
-    sh.dense = K.look === "peony" ? 0.55 : K.look === "dahlia" ? 0.8 : 1; // 촘촘한 모란은 겹쳐 흰 원판이 되지 않게 어둡게
+    sh.dense = K.look === "peony" ? 0.55 : K.look === "dahlia" ? 0.8 : K.look === 'palm' ? 0.72 : K.look === 'kamuro' ? 0.8 : K.look === 'brocade' ? 0.85 : 1; // 16차 U9: brocade 긴 꼬리가 겹쳐 하얗게 번지지 않게 0.85 // 16차 U8: kamuro(원판 채움)도 0.8 — 촘촘한 모란은 겹쳐 흰 원판이 되지 않게 어둡게(16차 U7: 채움 별 palm 도)
     // ---- 별 목록 ----
     const ex = egg.ex;
     const rings = []; // [별 수, 종류: 'band'(띠 별) | 'sphere'(구면 투영 점별), 반경, 꼬리 끝 반경]
@@ -521,39 +525,59 @@ export class Bursts {
     const minN = Math.ceil((2 * Math.PI * egg.rout * (1 + 2 * LK.angJit)) / (LK.starGap * 0.97));
     const inner = (rim, rEnd) => (egg.rout - rEnd > 1.2 ? Math.round((rim * LK.inner.frac) / (1 - LK.inner.frac)) : 0);
     if (K.look === 'peony') rings.push([randi(K.stars[0], K.stars[1]), 'sphere', egg.rout, 0]);
-    else {
-      const rEnd = K.look === 'dahlia' ? K.core.r - 0.1 : egg.rin;
+    else if (K.look === 'palm') {
+      // 16차 U7 palm: 바깥 테(r_out)부터 안쪽으로 rowGap 마다 채움 별 줄 — 줄 안 별 간격 ≤ starGap × (1 + 2·jit), 꼬리(tail)가 줄 사이 틈을 메운다(바퀴살 없음)
+      const FL = K.fill;
+      for (let r = egg.rout - 0.5 * FL.head[1]; r >= egg.rin + 0.12; r -= FL.rowGap) {
+        const cnt = Math.ceil((2 * Math.PI * r) / FL.starGap);
+        rings.push([cnt, 'fill', r, egg.rin]);
+      }
+    } else {
+      const rEnd = K.core ? K.core.r - 0.1 : egg.rin; // 16차 U8: 심(core)이 있는 원판(dahlia · kamuro)은 꼬리가 심 바깥에서 끝남
       const rim = Math.max(randi(K.stars[0], K.stars[1]), minN);
       rings.push([rim, 'band', egg.rout, rEnd]);
       const ni = inner(rim, rEnd);
       if (ni) rings.push([ni, 'inner', egg.rout, rEnd]);
-      if (K.look === 'dahlia') rings.push([K.core.n, 'sphere', K.core.r, 0]);
+      if (K.core) rings.push([K.core.n, 'sphere', K.core.r, 0]);
     }
     let n = 0;
     for (const r of rings) n += r[0];
     sh.n = n;
     sh.nOuter = rings[0][0];
     this._alloc(sh, n);
-    const willow = K.look === 'willow';
+    const brocade = K.look === 'brocade'; // 16차 U9: brocade = 금·은빛 반짝이는 긴 꼬리 띠(모든 별 꼬리가 r_in 까지, 짧은 꼬리 없음)
+    const willow = K.look === 'willow' || K.look === 'kamuro' || brocade; // 16차 U8: kamuro = 금빛 굵은 별(버드나무와 같은 머리·꼬리·색), 늘어짐은 판정 뒤(after willow)
     let i = 0;
     for (const [cnt, typ, Rr, rEnd] of rings) {
       const th0 = dr(0, Math.PI * 2);
       const step = (Math.PI * 2) / cnt;
+      const FL = K.fill;
       for (let q = 0; q < cnt; q++, i++) {
-        const a = th0 + (q + 0.5 + dr(-LK.angJit, LK.angJit)) * step; // 층화 각도 + 흔들림 ±0.4칸
-        const hr = willow ? dr(0.11, 0.14) : typ === 'sphere' ? dr(0.07, 0.1) : dr(LK.head[0], LK.head[1]);
+        const a = th0 + (q + 0.5 + dr(-(typ === 'fill' ? FL.jit : LK.angJit), typ === 'fill' ? FL.jit : LK.angJit)) * step; // 층화 각도 + 흔들림 ±0.4칸
+        const hr = willow ? (K.look === 'kamuro' ? dr(0.085, 0.11) : brocade ? dr(0.08, 0.1) : dr(0.11, 0.14)) : typ === 'sphere' ? dr(0.07, 0.1) : typ === 'fill' ? dr(FL.head[0], FL.head[1]) : dr(LK.head[0], LK.head[1]);
         let rh, endR, depth, half, floor, tw0, tw1, tip, spk;
-        if (typ === 'band' || typ === 'inner') {
-          rh = (Rr - 0.5 * hr) * (typ === 'inner' ? dr(LK.inner.j[0], LK.inner.j[1]) : dr(1 - 2 * LK.spdJit, 1)); // 속도 흔들림 −2%~0(머리 바깥 끝이 r_out 을 넘지 않게) · 안쪽 머리 별
+        if (typ === 'fill') {
+          // palm 채움 별: 그 줄 반경(속도 흔들림 −1%~0), 짧은 꼬리(안쪽으로 tail, 구멍 r_in + 0.05 을 넘지 않게), 가는 꼬리, 끝 점 없음
+          rh = Rr * dr(0.99, 1);
+          const tl = Math.max(0.05, Math.min(FL.tail, rh - rEnd - 0.05));
+          endR = Math.max(0, (rh - tl) / rh);
+          depth = dr(0, LK.depthJit);
+          half = tl * 0.55;
+          floor = 0.22;
+          tw0 = 0.026;
+          tw1 = 0.006;
+          tip = 0;
+        } else if (typ === 'band' || typ === 'inner') {
+          rh = (Rr - (K.look === 'kamuro' ? 0.95 : 0.5) * hr) * (typ === 'inner' ? dr(LK.inner.j[0], LK.inner.j[1]) : dr(1 - 2 * LK.spdJit, 1)); // 속도 흔들림 −2%~0(머리 바깥 끝이 r_out 을 넘지 않게) · 안쪽 머리 별
           // 35% 는 꼬리가 띠 중간에서 끝남(길이가 제각각인 진짜 국화) — 나머지 65% 가 r_in 의 끝 점 테를 만든다
-          const shortT = rEnd > 0.5 && Rr - rEnd > 1.2 && drand() < 0.35;
+          const shortT = !brocade && rEnd > 0.5 && Rr - rEnd > 1.2 && drand() < 0.35; // 16차 U9: brocade 는 모든 꼬리가 r_in 까지(긴 꼬리)
           endR = Math.min(0.98, (shortT ? rEnd + dr(0.25, 0.6) * (rh - rEnd) : Math.max(0, rEnd)) / rh);
           depth = dr(0, LK.depthJit); // 깊이 흔들림 0~+0.25m(카메라 반대쪽 — 화면에서 바깥 테가 커 보이지 않게)
-          half = Math.max(0.15, (rh - rEnd) * LK.tailHalf);
-          floor = LK.tailFloor;
-          tw0 = willow ? 0.075 : LK.tailW[0];
-          tw1 = willow ? 0.022 : LK.tailW[1];
-          tip = shortT ? 0 : 1;
+          half = Math.max(0.15, (rh - rEnd) * (brocade ? 0.8 : LK.tailHalf)); // brocade: 꼬리 밝기가 끝까지 남는다(반감 길이 × 0.8)
+          floor = brocade ? 0.5 : LK.tailFloor;
+          tw0 = brocade ? 0.05 : willow ? 0.075 : LK.tailW[0];
+          tw1 = brocade ? 0.016 : willow ? 0.022 : LK.tailW[1];
+          tip = shortT || brocade ? 0 : 1;
         } else {
           // 구면 투영: 3D 방향 고르게 → 면 위 반경 = R·√(1 − z²)(가장자리가 촘촘한 진짜 모란), 깊이 = z × 0.25
           const z = dr(-1, 1);
@@ -579,7 +603,7 @@ export class Bursts {
         sh.tw0[i] = tw0;
         sh.tw1[i] = tw1;
         sh.tip[i] = tip;
-        sh.spk[i] = drand() < LK.sparkle.frac ? dr(LK.sparkle.hz[0], LK.sparkle.hz[1]) : 0;
+        sh.spk[i] = drand() < (typ === 'fill' ? FL.sparkle : brocade ? 0.6 : LK.sparkle.frac) ? dr(LK.sparkle.hz[0], LK.sparkle.hz[1]) : 0;
         sh.life[i] = dr(K.life[0], K.life[1]);
         sh.size[i] = hr;
         sh.core[i] = typ === 'sphere' && rings.length > 1 ? 1 : 0;
@@ -588,7 +612,7 @@ export class Bursts {
     }
     // 색: 위협 8색 중 하나(상대 휘도를 금색과 같게) × HDR 1.8~2.2. 30% 는 날아가며 다른 색으로 바뀐다(2색). 버드나무는 금빛
     const pal = Object.keys(BURST.colors).filter((c) => !BURST.colorDrop.includes(c));
-    sh.colName = willow ? 'gold' : pal[Math.floor(dr(0, pal.length)) % pal.length];
+    sh.colName = brocade ? (drand() < 0.5 ? 'gold' : 'silver') : willow ? 'gold' : pal[Math.floor(dr(0, pal.length)) % pal.length]; // 16차 U9: brocade 금빛·은빛
     sh.hdr = willow ? 1.7 : dr(LK.hdr[0], LK.hdr[1]);
     sh.color = Bursts.lumColor(BURST.colors[sh.colName]);
     if (!willow && drand() < BURST.twoTone) {
@@ -960,11 +984,41 @@ export class Bursts {
   }
 
   // 발사 자리: 터질 자리 아래, 조금 먼 쪽 땅·옥상·수면
+  // 15차 A-6: 터질 자리에서 앞 6~14m, 바깥쪽 옆 10~25m 의 옥상·거리·수면(옆 탑 제외). 폭발 − 발사 ≥ 12m, 꼬리 수평에서 35° 이상.
+  //   후보가 없으면 땅·수면에서 쏜다(지붕보다 낮은 꼬리는 건물에 가려져도 됨). 판정·범위 원과는 무관(그림만)
   _launchSite(sh) {
     const C = this.course;
-    const W = C.toWorld(sh.s + rand(4, 9), sh.uc + rand(-1.5, 1.5), 0, new THREE.Vector3());
-    W.y = this.world && this.world.surfaceY ? this.world.surfaceY(W.x, W.z) + 0.4 : 0.6;
+    const Wd = this.world;
+    const W = new THREE.Vector3();
+    const Cw = sh.Cw;
+    const out = Math.abs(sh.uc) > 0.5 ? Math.sign(sh.uc) : Math.random() < 0.5 ? -1 : 1;
+    const L = this.log.launch || (this.log.launch = { n: 0, ok: 0, fallback: 0, tail12: 0, steep: 0, roofOk: 0, roofOkAll: 0 });
+    let found = false;
+    for (let k = 0; k < 18 && !found; k++) {
+      const sg = k < 12 ? out : -out;
+      C.toWorld(sh.s + rand(6, 14), sh.uc + sg * rand(10, 25), 0, W);
+      if (Wd && Wd.inTower && Wd.inTower(W.x, W.z, 2)) continue;
+      W.y = Wd && Wd.surfaceY ? Wd.surfaceY(W.x, W.z) + 0.4 : 0.6;
+      const dh = Cw.y - W.y;
+      const hz = Math.hypot(Cw.x - W.x, Cw.z - W.z);
+      if (dh >= 12 && Math.atan2(dh, hz) >= (35 * Math.PI) / 180) found = true;
+    }
+    if (!found) {
+      C.toWorld(sh.s + rand(6, 14), sh.uc + out * rand(10, 25), 0, W);
+      W.y = Wd && Wd.terrainY ? Math.max(0, Wd.terrainY(W.x, W.z)) + 0.4 : 0.6;
+      L.fallback++;
+    } else L.ok++;
     if (!(W.y > -5)) W.y = 0.6;
+    L.n++;
+    const dh = Cw.y - W.y;
+    if (dh >= 12) L.tail12++;
+    if (Math.atan2(dh, Math.hypot(Cw.x - W.x, Cw.z - W.z)) >= (35 * Math.PI) / 180) L.steep++;
+    // 점검: 폭발 중심 ≥ 반경 30m 안 지붕 최고 + 3m(옆 탑 빼고 / 넣고)
+    if (Wd && Wd.roofMax) {
+      if (Cw.y >= Wd.roofMax(Cw.x, Cw.z, 30, true, false) + 3) L.roofOk++;
+      if (Cw.y >= Wd.roofMax(Cw.x, Cw.z, 30, false, false) + 3) L.roofOkAll++;
+      if (Cw.y >= Wd.roofMax(Cw.x, Cw.z, 60, true, false) + 3) L.roof60 = (L.roof60 || 0) + 1;
+    }
     sh.Lw = W;
     sh.headW = W.clone();
   }
@@ -1149,7 +1203,7 @@ export class Bursts {
       const tipA = LK.tipDot.a;
       const dJ = dropJ(age);
       const gA = age > sh.tDrop ? sh.gAfter : 0;
-      const willow = sh.look === 'willow';
+      const willow = sh.look === 'willow' || sh.look === 'kamuro' || sh.look === 'brocade'; // 판정이 끝난 뒤(tLose > 0)에만 꼬리가 길게 흘러내림
       const O = sh.Cw;
       for (let i = 0; i < sh.n; i++) {
         const L = sh.life[i];

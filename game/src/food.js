@@ -7,14 +7,14 @@
 // - 줍기: 새 중심에서 1.0m 안(끌림 없음). 그 자리에서 0.15초 동안 작아진다.
 // - 그림: 조각 셰이더 한 장, 인스턴스 1개 = 그리기 호출 +1. 불꽃 색(금·주황·진홍)은 쓰지 않는다.
 import * as THREE from 'three';
-import { FOOD, COURSE, BIRDS, BURST } from './config.js';
+import { FOOD, ELLIPSE, BIRDS, BURST } from './config.js';
 import { CGRID, clearOf, reachOf, pathOf } from './choreo.js';
 
 const KINDS = ['mayfly', 'moth', 'crumb', 'grain'];
 const FEATHER = 8; // 그림 번호: 0~3 모델, 4~7 = HP 먹이(4 + 모델), 8 = 롤 깃털
 const rand = (a, b) => a + Math.random() * (b - a);
 const randi = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
-const E = COURSE.ellipse;
+const E = ELLIPSE; // 16차 U6a: 이동 타원은 모든 스테이지 공통
 const inEll = (u, w, k = 0.93) => (u / (E.u * k)) ** 2 + (w / (E.v * k)) ** 2 <= 1;
 
 const VERT = /* glsl */ `
@@ -286,7 +286,9 @@ export class Food {
       }
       return true;
     };
-    const want = randi(H.n[0], H.n[1]);
+    const SF = (course && course.stage && course.stage.food) || {}; // 16차 U6a: 그 스테이지 먹이 수(없으면 FOOD 기본)
+    const hpN = SF.hp || H.n, rollN = SF.roll || FOOD.roll.n;
+    const want = randi(hpN[0], hpN[1]);
     const cand = ws.filter((w) => w.i >= H.skipWaves || ws.indexOf(w) >= H.skipWaves);
     const chosen = [];
     let last = -99;
@@ -392,7 +394,7 @@ export class Food {
     };
     const gaps = [];
     for (let i = 1; i < ws.length; i++) gaps.push({ a: ws[i - 1], b: ws[i] });
-    const nRoll = randi(Rf.n[0], Rf.n[1]);
+    const nRoll = randi(rollN[0], rollN[1]);
     const placeRoll = (gp) => {
       const s0 = sHi(gp.a), s1 = sOf(gp.b);
       if (s1 - s0 < 2 * Rf.planeGap + 1) return null;

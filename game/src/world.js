@@ -5,16 +5,73 @@
 // 품질 예산 순서: 높이 안개 → 수면·유리의 불꽃 반사 → 창 불빛 밀도 → 블룸.
 // 그리기 호출을 줄이려고 같은 종류는 모두 인스턴스 한 번으로 그린다(건물 1, 구조물 1, 불빛 1, 간판 1 …).
 import * as THREE from 'three';
-import { SIGNS, LIGHTS, CITY, COURSE, remapS } from './config.js';
-// 12차 단위 3: 옛 코스(872m)에 고정했던 s 값은 remapS(옛 s)로 옮긴다(직선만 늘림 — 「비율로 옮김」). 코스 끝까지 도는 반복은 COURSE.length 까지
-const S_END = () => COURSE.length + 150;
+import { SIGNS, LIGHTS, CITY, ELLIPSE, remapS } from './config.js';
+// 12차 단위 3: 옛 코스(872m)에 고정했던 s 값은 remapS(옛 s, 코스 정의)로 옮긴다(직선만 늘림 — 「비율로 옮김」). 코스 끝까지 도는 반복은 그 코스 길이까지
+// 16차 U6a: S1 상수(COURSE) 대신 그 스테이지 코스(course.length · course.def)
+const S_END = (C) => C.length + 150;
 import { FLASH_GLSL } from './lights.js';
 import { FACADES } from './assets.js';
 import { Path2D } from './course.js';
+import { buildAlley, SIGN_WORDS } from './alley.js';
+import { buildOverpass } from './overpass.js';
+import { buildCanyon } from './canyon.js';
+import { buildRiverside } from './riverside.js';
 
 const N = LIGHTS.count;
 const rand = (a, b) => a + Math.random() * (b - a);
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// ---------- 16차 U6a: 건물 생성기 표 ----------
+// g = { x, z, n(가장 가까운 길 점), au(|u|), bd(물가 거리), cv(통로 중심), sC, w, d(기본 크기), halfDiag0, roadNear, lit }
+// 돌려줌: { kind, h, w, d } · null(이 생성기에 안 맞음 → 다음) · SKIP(이 칸은 비움). 점등률을 바꾸면 g.lit 에 쓴다
+// 난수 부르는 순서는 15차 _buildCity 분기와 같다(회귀 하네스 ① 이 같아야 함)
+const SKIP = 'skip';
+const CITY_GEN = {
+  // 15차 시내(옛 협곡): 유리 업무 빌딩 — 가까운 띠는 아래 상한으로 지붕 위, 먼 띠는 스카이라인
+  glass(g) {
+    if (g.au < 120 && g.n.d < 125) return { kind: 1, h: rand(48, 112) * (g.au < 60 ? 1 : 0.8), w: rand(18, 26), d: rand(16, 24) };
+    // 15차 먼 스카이라인: 시내 구간 먼 띠(> 180m)의 유리 고층 48~112m
+    if (g.n.d < CITY.fill && g.au - g.halfDiag0 > CITY.cap.mid && Math.random() < 0.5) return { kind: 1, h: rand(48, 112), w: rand(18, 26), d: rand(16, 24) };
+    return null;
+  },
+  // 협곡 출구 → 옥상: 지붕이 통로 아래로 낮아진다(가까울수록 통로 바닥 바로 아래)
+  lowRoof(g) {
+    if (!(g.au < 170)) return null;
+    const kind = Math.random() < 0.3 ? 1 : 2;
+    const below = g.cv - ELLIPSE.v - rand(3.5, 9);
+    const h = g.au < 70 ? below : rand(Math.max(10, below - 6), below + 14);
+    const w = rand(16, 24);
+    const d = rand(14, 22);
+    g.lit = rand(0.35, 0.6);
+    return { kind, h, w, d };
+  },
+  // 강변 아파트(판상형, 물가 140m 안) — 11차 배3: 35% 는 탑상형(두 상자를 十자로) / 그 밖은 아파트·상가
+  base(g) {
+    if (g.bd < 140) {
+      const h = Math.round(rand(36, 66) / 2.8) * 2.8 + 1.4;
+      let w = rand(40, 56);
+      let d = rand(13, 15);
+      if (Math.random() < 0.35) { w = rand(22, 26); d = rand(10, 12); }
+      if (g.roadNear(g.x, g.z, Math.hypot(w, d) / 2)) return SKIP;
+      return { kind: 0, h, w, d };
+    }
+    const kind = Math.random() < 0.55 ? 0 : 2;
+    const h = kind === 0 ? Math.round(rand(30, 60) / 2.8) * 2.8 + 1.4 : rand(10, 28);
+    let w = g.w, d = g.d;
+    if (kind === 0) {
+      w = rand(36, 50);
+      d = rand(13, 15);
+      if (g.roadNear(g.x, g.z, Math.hypot(w, d) / 2)) return SKIP;
+    }
+    return { kind, h, w, d };
+  },
+};
+// 구역 id → [{ gen, sBelow? }, …, { gen: 'base' }]
+function kitList(kit, zoneId) {
+  const a = ((kit && kit.zones && kit.zones[zoneId]) || []).map((e) => (typeof e === 'string' ? { gen: e } : e));
+  a.push({ gen: 'base' });
+  return a;
+}
 
 const HASH_GLSL = /* glsl */ `
 float hash(vec2 p) {
@@ -89,6 +146,9 @@ function makeBuildingMaterial(shared) {
     uniforms: {
       ...shared,
       uFacadeOn: { value: 0 },
+      uWarmWin: { value: new THREE.Vector3(1.0, 0.6, 0.3) }, // 16차 U8: 따뜻한 창 빛(스테이지 city.warmWin, 없으면 15차 그대로)
+      uGuard: { value: 0 }, // 16차 U8: 붉은 주황 막기(city.roGuard — S1·S2 0)
+      uGlassTint: { value: new THREE.Vector4(0, 0, 0, 0) }, // 16차 U10: 유리(kind 1) 색조 rgb·세기 w(city.glassTint — S4 만, 나머지 0)
       uFC0: { value: blank }, uFE0: { value: blank },
       uFC1: { value: blank }, uFE1: { value: blank },
       uFC2: { value: blank }, uFE2: { value: blank },
@@ -123,6 +183,9 @@ function makeBuildingMaterial(shared) {
     `,
     fragmentShader: /* glsl */ `
       uniform float uFacadeOn;
+      uniform vec3 uWarmWin;
+      uniform float uGuard;
+      uniform vec4 uGlassTint;
       uniform sampler2D uFC0; uniform sampler2D uFE0;
       uniform sampler2D uFC1; uniform sampler2D uFE1;
       uniform sampler2D uFC2; uniform sampler2D uFE2;
@@ -145,7 +208,7 @@ function makeBuildingMaterial(shared) {
         float k2 = hash(hid + vec2(seed, 7.0));
         // 11차 배3: 색온도는 건물(단지) 단위로 치우침 — 따뜻한 2700K 단지 / 백색 LED 4000K 단지, 집마다 20% 는 다른 색
         float bt = hash(vec2(seed, 21.7));
-        vec3 warm = vec3(1.0, 0.6, 0.3), led = vec3(0.92, 0.9, 0.86);
+        vec3 warm = uWarmWin, led = vec3(0.92, 0.9, 0.86); // 16차 U8: 따뜻한 창 빛은 스테이지 값(S1·S2 (1, 0.6, 0.3) 그대로)
         vec3 wc = k2 < 0.8 ? (bt < 0.5 ? warm : led) : (bt < 0.5 ? led : warm);
         if (k2 > 0.97) wc = vec3(0.76, 0.86, 1.0);
         wc *= (0.35 + 0.55 * hash(id + vec2(3.0, 9.0))) * gain;
@@ -240,7 +303,7 @@ function makeBuildingMaterial(shared) {
                 if (hash(hid + seed * 13.1) < lit && wf.x > 0.0 && wf.x < 1.0 && wf.y > 0.0 && wf.y < 1.0) {
                   float k2 = hash(hid + vec2(seed, 7.0));
                   float bt = hash(vec2(seed, 21.7));
-                  vec3 lc = k2 < 0.8 ? (bt < 0.5 ? vec3(1.0, 0.6, 0.3) : vec3(0.92, 0.9, 0.86)) : (bt < 0.5 ? vec3(0.92, 0.9, 0.86) : vec3(1.0, 0.6, 0.3));
+                  vec3 lc = k2 < 0.8 ? (bt < 0.5 ? uWarmWin : vec3(0.92, 0.9, 0.86)) : (bt < 0.5 ? vec3(0.92, 0.9, 0.86) : uWarmWin);
                   lc *= (0.5 + 0.5 * hash(cid + vec2(3.0, 9.0))) * gain;
                   vec3 ic = interior(wf, cid, seed, normalize(vN), lc);
                   // 12차 배8: 실내 그림(생성 이미지 6종 중 집마다 하나) — 시선 따라 조금 밀려 깊이감, 그 집 불빛 색으로 살짝 물들임
@@ -341,19 +404,67 @@ function makeBuildingMaterial(shared) {
               float mul = 1.0 - smoothstep(0.0, fwm.x * 1.5 + 0.02, min(fract(hx / 1.5), 1.0 - fract(hx / 1.5)));
               float flr = 1.0 - smoothstep(0.0, fwm.y * 1.5 + 0.03, min(fract(vWP.y / 3.4), 1.0 - fract(vWP.y / 3.4)));
               col = mix(col, vec3(0.05, 0.055, 0.065) * amb * 4.0, max(mul * 0.6, flr * 0.8) * step(4.6, vWP.y));
+              // 16차 U10(gate16s4 권고 a): 스테이지 유리 색조(S4 만, 다른 스테이지 w = 0 이라 건너뜀) — 순수 검정 몸체를 짙은 청록 쪽으로(비스듬히 볼수록 조금 더),
+              //   층 띠(가로 멀리언)를 약하게 밝혀 「유리 커튼월」로 읽히게
+              if (uGlassTint.w > 0.0) {
+                float gl = step(4.6, vWP.y) * uGlassTint.w;
+                float grazing = pow(1.0 - abs(dot(normalize(vWP - cameraPosition), vN)), 2.0);
+                col += uGlassTint.rgb * gl * (0.55 + 0.45 * grazing) * (1.0 - flr * 0.8);
+                col += uGlassTint.rgb * gl * flr * 1.6;
+              }
             }
             col = mix(col, albedo * amb * 1.4, 1.0 - smoothstep(0.35, 0.6, topM));
           } else {
             col = albedo * amb * 0.5;
           }
-        } else {
+        } else if (kind < 3.5) {
           // ---- 옥상 구조물·기둥 ----
           albedo = vec3(0.2, 0.2, 0.22);
           col = albedo * amb;
+        } else {
+          // ---- 16차 U7 낡은 상가(4 = 앞면 −z · 5 = 앞면 +z · 6 = 앞면 없음): 타일·페인트 벽, 층 3.3m, 창 3m 칸, 1층 가게 유리, 옥상 방수 페인트 ----
+          float wsel = hash(vec2(seed, 41.0));
+          albedo = wsel < 0.3 ? vec3(0.4, 0.37, 0.32) : (wsel < 0.5 ? vec3(0.33, 0.33, 0.35) : (wsel < 0.65 ? vec3(0.3, 0.35, 0.31) : (wsel < 0.82 ? vec3(0.3, 0.33, 0.39) : vec3(0.35, 0.29, 0.25))));
+          albedo *= 0.8 + 0.35 * hash(vec2(seed, 43.0));
+          col = albedo * amb;
+          if (side) {
+            float hb = vLocal.y * vScale.y;
+            vec2 cell = vec2(hx / 3.0 + floor(seed * 0.37), (hb - 4.2) / 3.3);
+            vec4 w = windows(cell, vec2(0.16, 0.3), vec2(0.84, 0.82), seed, lit, gain);
+            float rows = step(4.2, hb) * step(0.9, topM);
+            // 2~3층 일부 창은 광고 시트(시안·보라·초록) — 위험색 아님
+            vec2 cid = floor(cell);
+            float ad = step(0.85, hash(cid + vec2(seed, 51.0))) * step(cid.y, 1.5) * (1.0 - smoothstep(0.3, 0.8, max(fwidth(cell).x, fwidth(cell).y)));
+            float ak = hash(cid + vec2(53.0, seed));
+            vec3 adc = ak < 0.34 ? vec3(0.2, 0.75, 1.0) : (ak < 0.67 ? vec3(0.62, 0.36, 1.0) : vec3(0.4, 1.0, 0.45));
+            w.rgb = mix(w.rgb, adc * 0.32 * gain, ad);
+            col = mix(col, w.rgb, w.a * rows);
+            float fy = fract((hb - 4.2) / 3.3);
+            col += albedo * amb * (smoothstep(0.0, 0.03, fy) - smoothstep(0.06, 0.09, fy)) * rows * 0.5;
+            // 1층 가게(앞면만): 가게마다 4.5m 칸 · 열린 가게 빛(따뜻한 흰빛·찬 흰빛) · 닫힌 가게 셔터
+            float front = kind < 4.5 ? step(vNL.z, -0.5) : (kind < 5.5 ? step(0.5, vNL.z) : 0.0);
+            float shop = step(0.3, hb) * (1.0 - step(3.7, hb));
+            float sid = floor(hx / 4.5);
+            float open = step(0.2, hash(vec2(sid, seed + 2.0)));
+            float sk = hash(vec2(sid, seed));
+            vec3 sc2 = sk < 0.55 ? vec3(1.0, 0.86, 0.62) : (sk < 0.8 ? vec3(0.78, 0.92, 1.0) : vec3(0.85, 1.0, 0.9));
+            float frame = step(0.06, fract(hx / 4.5)) * step(fract(hx / 4.5), 0.94);
+            vec3 shutter = albedo * amb * (0.55 + 0.35 * step(0.5, fract(hb * 5.0)));
+            vec3 sf = open > 0.5 ? sc2 * (0.45 + 0.4 * hash(vec2(sid, seed + 5.0))) * frame * gain : shutter;
+            col = mix(col, sf, shop * front);
+            col = mix(col, albedo * amb * 1.3, 1.0 - smoothstep(0.3, 0.6, topM));
+          } else {
+            // 옥상: 초록 방수 페인트 55% · 회색 30% · 낡은 갈색 15%, 얼룩
+            float rs = hash(vec2(seed, 61.0));
+            albedo = rs < 0.55 ? vec3(0.12, 0.2, 0.15) : (rs < 0.85 ? vec3(0.2, 0.2, 0.21) : vec3(0.22, 0.17, 0.14));
+            col = albedo * amb * (0.72 + 0.4 * vnoise(vWP.xz * 0.35 + seed));
+          }
         }
         // 12차 배6: 바닥 쪽 그늘(땅에 가까울수록 어둡게, 9m 까지)
         if (side) col *= mix(0.55, 1.0, smoothstep(0.0, 9.0, vLocal.y * vScale.y));
         col = bgGrade(col);
+        // 16차 U8: 새 스테이지(uGuard 1)는 창·실내 그림의 붉은 주황(빨강이 가장 크고 초록이 빨강의 55% 아래)을 호박색 쪽으로 — 붉은 주황은 위험 전용
+        if (uGuard > 0.5 && col.r > col.b) col.g = max(col.g, col.r * 0.55 + col.b * 0.45);
         col += albedo * 3.0 * flashAt(vWP, vN, 0.2);
         gl_FragColor = vec4(applyFog(col, vWP), 1.0);
         #include <tonemapping_fragment>
@@ -606,8 +717,10 @@ function makeRibbonMaterial(shared, road = false) {
               if (abs(al - uCross[i]) < 3.0 && ao < H - 0.6) wht = max(wht, 1.0 - smoothstep(0.5 - 0.06, 0.5 + 0.06, fract(off / 0.9 + 0.25)) );
             }
           }
-          col = mix(col, vec3(0.17, 0.125, 0.035), yel * 0.9);
-          col = mix(col, vec3(0.15, 0.15, 0.145), wht * 0.85);
+          // 16차 U7: 골목·광장(종류 3)은 노면 표시 없음
+          float mk3 = 1.0 - step(2.5, kind);
+          col = mix(col, vec3(0.17, 0.125, 0.035), yel * 0.9 * mk3);
+          col = mix(col, vec3(0.15, 0.15, 0.145), wht * 0.85 * mk3);
           // 젖은 노면: 웅덩이(덮는 비율 약 20%, 1.5~6m) — 하늘·도시광을 1.6배 비춘다
           float rr = uTexOn > 0.5 ? texture2D(uAsphR, tuv * 0.37).r : 0.5;
           float pm = 0.62 * vnoise(vWP.xz / 4.5) + 0.38 * vnoise(vWP.xz / 1.7 + 3.1) + (rr - 0.5) * 0.15;
@@ -743,15 +856,24 @@ function makeSkyMaterial(shared) {
 // 먼 산 능선(전파탑 없음): 어두운 실루엣, 위로 갈수록 하늘과 이어진다
 function makeRidgeMaterial(shared) {
   return new THREE.ShaderMaterial({
-    uniforms: { uFogColor: shared.uFogColor, uCityGlow: shared.uCityGlow, uBase: { value: new THREE.Color(0x0a0c18) } },
+    uniforms: { uFogColor: shared.uFogColor, uCityGlow: shared.uCityGlow, uBase: { value: new THREE.Color(0x0a0c18) }, uClampD: { value: 1e9 } },
     vertexShader: /* glsl */ `
+      uniform float uClampD; // 16차 3-4: 모바일 far 1100 — 그보다 먼 능선은 같은 방향 그 거리로 당겨 그린다(화면 자리 같음)
       varying float vH;
       varying float vY;
       void main() {
         vH = uv.y;
         vec4 wp = modelMatrix * vec4(position, 1.0);
         vY = wp.y;
-        gl_Position = projectionMatrix * viewMatrix * wp;
+        if (uClampD < 1e8) {
+          vec4 mv = viewMatrix * wp;
+          float dd = length(mv.xyz);
+          float cd = uClampD * 0.98;
+          if (dd > cd) mv.xyz *= cd / dd;
+          gl_Position = projectionMatrix * mv;
+        } else {
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
       }
     `,
     fragmentShader: /* glsl */ `
@@ -773,16 +895,25 @@ function makeRidgeMaterial(shared) {
 // 창 점은 1겹에만(블록 평균, 점등률 0.15). 혼합 없음(불투명), 실루엣은 꼭짓점 높이로
 function makeFarCardMaterial(shared) {
   return new THREE.ShaderMaterial({
-    uniforms: { uFogColor: shared.uFogColor, uCityGlow: shared.uCityGlow, uTime: shared.uTime, uSkyA: { value: BLANK }, uSkyB: { value: BLANK }, uSkyOn: { value: 0 }, uSkyRep: { value: 1361 } },
+    uniforms: { uFogColor: shared.uFogColor, uCityGlow: shared.uCityGlow, uTime: shared.uTime, uSkyA: { value: BLANK }, uSkyB: { value: BLANK }, uSkyOn: { value: 0 }, uSkyRep: { value: 1361 }, uClampD: { value: 1e9 } },
     vertexShader: /* glsl */ `
       attribute vec3 aF; // 겹(0·1·2), 가로 위치(m), 높이 비율(0 바닥 ~ 1 꼭대기)
+      uniform float uClampD; // 16차 3-4: 모바일 far — 먼 카드는 방향 그대로 당겨 그림(가까운 겹이 앞에 오게 겹마다 조금씩 다른 거리)
       varying vec3 vF;
       varying float vY;
       void main() {
         vF = aF;
         vec4 wp = modelMatrix * vec4(position, 1.0);
         vY = wp.y;
-        gl_Position = projectionMatrix * viewMatrix * wp;
+        if (uClampD < 1e8) {
+          vec4 mv = viewMatrix * wp;
+          float dd = length(mv.xyz);
+          float cd = uClampD * (0.88 + 0.02 * aF.x);
+          if (dd > cd) mv.xyz *= cd / dd;
+          gl_Position = projectionMatrix * mv;
+        } else {
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
       }
     `,
     fragmentShader: /* glsl */ `
@@ -948,12 +1079,14 @@ function makeReflMaterial(shared, maskU, boxU) {
 // aA: 선분 시작 xyz, 위상 / aB: 선분 끝 xyz, 초당 위상(속도 ÷ 길이) / aC: 줄기 길이, 폭, 밝기, (안 씀)
 function makeCarMaterial(shared) {
   return new THREE.ShaderMaterial({
-    uniforms: { uTime: shared.uTime, uFogDensity: shared.uFogDensity },
+    uniforms: { uTime: shared.uTime, uFogDensity: shared.uFogDensity, uTail: { value: new THREE.Vector3(1.0 * 0.5, 0.12 * 0.5, 0.06 * 0.5) }, uBrakeK: { value: 1.6 } }, // 16차 U8: 꼬리등 색·브레이크 세기는 스테이지 값(S1 은 15차 그대로)
     vertexShader: /* glsl */ `
       attribute vec4 aA;
       attribute vec4 aB;
       attribute vec4 aC;
       uniform float uTime;
+      uniform vec3 uTail;
+      uniform float uBrakeK;
       varying vec3 vCol;
       varying vec2 vQ;
       varying float vFogDepth;
@@ -974,8 +1107,8 @@ function makeCarMaterial(shared) {
         vec3 Rl = normalize(cross(D, vec3(0.0, 1.0, 0.0)));
         W += Rl * position.z * (aC.w > 0.5 ? 1.05 : 0.72); // 12차: 전조등·미등 쌍
         bool toward = dot(D, cameraPosition - P) > 0.0;
-        float brake = toward ? 1.0 : 1.0 + 1.6 * smoothstep(0.82, 0.97, t); // 교차로(선분 끝) 앞에서 브레이크등
-        vCol = (toward ? vec3(1.0, 0.95, 0.85) * 0.8 : vec3(1.0, 0.12, 0.06) * 0.5 * brake) * aC.z;
+        float brake = toward ? 1.0 : 1.0 + uBrakeK * smoothstep(0.82, 0.97, t); // 교차로(선분 끝) 앞에서 브레이크등
+        vCol = (toward ? vec3(1.0, 0.95, 0.85) * 0.8 : uTail * brake) * aC.z;
         vCol *= clamp(min(t, 1.0 - t) * L / 12.0, 0.0, 1.0); // 선분 끝에서 부드럽게 나타나고 사라짐
         vQ = vec2(along, position.y * 2.0);
         vec4 mv = viewMatrix * vec4(W, 1.0);
@@ -1166,13 +1299,142 @@ function makeSignMaterial(shared, tex) {
   });
 }
 
+// ---------- 16차 U7: 전선(S2 전봇대 전선 다발) — 인스턴스 하나(그리기 호출 +1), 전선 하나 = 6마디 띠(삼각형 12) ----------
+// aA: 시작 xyz · 처짐(m), aB: 끝 xyz · 굵기(m). 띠는 화면을 향해 서고, 굵기는 화면 uMinPx(16차 U7b: 1.5px) 아래로 내려가지 않는다(깜빡임 방지)
+// instanceMatrix 는 그리지 않고 가운데 자리(가까운 것만 그리기 창이 읽음)만 담는다
+function makeWireMaterial(shared) {
+  return new THREE.ShaderMaterial({
+    uniforms: { ...shared, uPx: { value: 0.0015 }, uMinPx: { value: 1.5 }, uWireCol: { value: new THREE.Color(0.11, 0.11, 0.125) } }, // 16차 U7b(1-1): 최소 1.5px · 보안등에 비친 회색(검은 땅 위에서 보이게)
+    vertexShader: /* glsl */ `
+      attribute vec4 aA;
+      attribute vec4 aB;
+      uniform float uPx;
+      uniform float uMinPx;
+      varying vec3 vWP;
+      varying float vFogDepth;
+      void main() {
+        float t = position.x;
+        float sd = position.y;
+        vec3 A = aA.xyz, B = aB.xyz;
+        vec3 P = mix(A, B, t);
+        P.y -= aA.w * 4.0 * t * (1.0 - t);
+        vec3 T = B - A;
+        T.y -= aA.w * (4.0 - 8.0 * t);
+        vec3 V = cameraPosition - P;
+        float d = length(V);
+        vec3 S = cross(T, V);
+        S = S / max(length(S), 1e-5);
+        float w = max(aB.w, d * uPx * uMinPx);
+        P += S * (0.5 * w * sd);
+        vWP = P;
+        vec4 mv = viewMatrix * vec4(P, 1.0);
+        vFogDepth = -mv.z;
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying vec3 vWP;
+      uniform vec3 uWireCol;
+      ${FLASH_GLSL}
+      ${FOG_GLSL}
+      void main() {
+        vec3 col = uWireCol + vec3(0.06, 0.05, 0.04) * flashAt(vWP, vec3(0.0, 1.0, 0.0), 0.5);
+        gl_FragColor = vec4(applyFog(col, vWP), 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+    side: THREE.DoubleSide, // 16차 U7b(1-1): 화면을 향해 세운 띠의 감김 방향이 카메라 반대라 앞면만 그리면 모두 잘려 나갔다(U7 에서 전선이 0px 이던 원인)
+  });
+}
+
+// ---------- 16차 U7: 야시장 천막(S2) — 인스턴스 하나(그리기 호출 +1). aPart: 0 진열대(빛) · 1 뒷판 · 2 천막 지붕(줄무늬) ----------
+function makeStallGeometry() {
+  const P = [], R = [];
+  const quad = (a, b, c, d, part) => { P.push(...a, ...b, ...c, ...a, ...c, ...d); for (let i = 0; i < 6; i++) R.push(part); };
+  const box = (x0, x1, y0, y1, z0, z1, part) => {
+    quad([x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0], part); // 위
+    quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1], part); // +z
+    quad([x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0], part); // −z
+    quad([x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1], part); // +x
+    quad([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0], part); // −x
+  };
+  box(-1.2, 1.2, 0, 1.0, -0.8, 0.6, 0); // 진열대(앞 −z)
+  box(-1.2, 1.2, 0, 2.15, 0.6, 0.72, 1); // 뒷판
+  // 천막: 처마 2.2m(±1.5 × ±1.15) → 용마루 2.8m(±0.9, z 0)
+  const e = 2.2, r = 2.8;
+  quad([-1.5, e, -1.15], [-0.9, r, 0], [0.9, r, 0], [1.5, e, -1.15], 2);
+  quad([1.5, e, 1.15], [0.9, r, 0], [-0.9, r, 0], [-1.5, e, 1.15], 2);
+  P.push(-1.5, e, 1.15, -0.9, r, 0, -1.5, e, -1.15); R.push(2, 2, 2);
+  P.push(1.5, e, -1.15, 0.9, r, 0, 1.5, e, 1.15); R.push(2, 2, 2);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+  g.setAttribute('aPart', new THREE.Float32BufferAttribute(R, 1));
+  g.computeVertexNormals();
+  return g;
+}
+function makeStallMaterial(shared) {
+  return new THREE.ShaderMaterial({
+    uniforms: { ...shared },
+    side: THREE.DoubleSide,
+    vertexShader: /* glsl */ `
+      attribute float aPart;
+      varying vec3 vWP; varying vec3 vN; varying vec3 vL; varying vec3 vCol; varying float vPart; varying float vFogDepth;
+      void main() {
+        mat4 m = modelMatrix * instanceMatrix;
+        vec4 wp = m * vec4(position, 1.0);
+        vWP = wp.xyz;
+        vN = normalize(mat3(m) * normal);
+        vL = position;
+        #ifdef USE_INSTANCING_COLOR
+        vCol = instanceColor;
+        #else
+        vCol = vec3(0.5);
+        #endif
+        vPart = aPart;
+        vec4 mv = viewMatrix * wp;
+        vFogDepth = -mv.z;
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying vec3 vWP; varying vec3 vN; varying vec3 vL; varying vec3 vCol; varying float vPart;
+      ${HASH_GLSL}
+      ${FLASH_GLSL}
+      ${FOG_GLSL}
+      ${LIGHT_GLSL}
+      void main() {
+        vec3 amb = ambientAt(vWP, vN);
+        vec3 col;
+        if (vPart > 1.5) {
+          // 천막: 가로 0.5m 줄무늬(그 색 / 흰색) · 아래 전구 빛을 받아 은은히 밝다
+          float st = step(0.5, fract((vL.x + 3.0) / 1.0));
+          vec3 c = mix(vCol, vec3(0.78, 0.8, 0.84), st * 0.55);
+          col = c * (amb * 1.2 + 0.2);
+        } else if (vPart > 0.5) {
+          col = vec3(0.05, 0.05, 0.06) * amb * 4.0;
+        } else {
+          // 진열대: 따뜻한 조명을 받은 물건(작은 얼룩)
+          float n = hash(floor(vL.xz * 5.0) + floor(vWP.xz));
+          col = vec3(1.0, 0.82, 0.56) * (0.28 + 0.26 * n) * (vN.y > 0.5 ? 1.25 : 0.8);
+        }
+        col = bgGrade(col);
+        col += vCol * 2.0 * flashAt(vWP, vN, 0.2);
+        gl_FragColor = vec4(applyFog(col, vWP), 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+}
+
 // ---------- 간판 아틀라스(캔버스 1장 2048×1024) ----------
 // 폰트(BvfSign = Black Han Sans 서브셋)를 못 읽으면 글자 없이 네온 테두리만 그린다(네모로 깨진 글자 없음).
-function buildAtlas(fontOk) {
+function buildAtlas(fontOk, ext = false) {
   const entries = [];
-  if (typeof document === 'undefined') return { tex: null, entries, fontOk: false };
+  if (typeof document === 'undefined') return { tex: null, entries, fontOk: false, ext };
   const W = 2048;
-  const H = 2048; // 11차 배4: 세로 간판 칸을 더하려고 1024 → 2048
+  const H = ext ? 3072 : 2048; // 11차 배4: 세로 간판 칸을 더하려고 1024 → 2048 · 16차 U7: S2 는 상자 간판 칸을 더해 3072
   const cv = document.createElement('canvas');
   cv.width = W;
   cv.height = H;
@@ -1263,11 +1525,110 @@ function buildAtlas(fontOk) {
     g.restore();
     entries.push({ kind: 'vert', text, color, uv: [r.x / W, 1 - (r.y + r.h) / H, r.w / W, r.h / H], aspect: r.w / r.h });
   });
+  if (ext === 'canyon') {
+    // 16차 U9(S4): LED 외벽 — 추상 무늬(띠·점 격자·물결·사선·막대·사각 겹) 6칸 + 일반어(OPEN · 24H · OPEN 24H) 3칸. 흰 무늬(색은 인스턴스 색 — 청록·보라·초록·흰색, 붉은 주황 없음)
+    x = 8;
+    y += 580;
+    const latin = 'bold 104px "Segoe UI", Arial, Helvetica, sans-serif'; // 라틴 글자(시스템 글꼴)
+    const pat = (k, r) => {
+      g.save();
+      g.beginPath();
+      g.rect(r.x + 4, r.y + 4, r.w - 8, r.h - 8);
+      g.clip();
+      g.fillStyle = 'rgba(255,255,255,0.08)';
+      g.fillRect(r.x, r.y, r.w, r.h);
+      g.fillStyle = '#ffffff';
+      g.strokeStyle = '#ffffff';
+      if (k === 0) for (let i = 0; i < 9; i++) { g.globalAlpha = 0.25 + 0.75 * ((i % 3) / 2); g.fillRect(r.x + 6, r.y + 8 + i * 14, r.w - 12, 7); }
+      else if (k === 1) for (let i = 0; i < 16; i++) for (let j = 0; j < 8; j++) { g.globalAlpha = (i * 7 + j * 3) % 5 < 2 ? 1 : 0.25; g.beginPath(); g.arc(r.x + 10 + i * ((r.w - 20) / 15), r.y + 12 + j * 16, 4.5, 0, 6.283); g.fill(); }
+      else if (k === 2) { g.lineWidth = 6; for (let i = 0; i < 4; i++) { g.globalAlpha = 0.4 + 0.2 * i; g.beginPath(); for (let px = 0; px <= r.w; px += 6) g.lineTo(r.x + px, r.y + 30 + i * 26 + Math.sin(px / 28 + i) * 12); g.stroke(); } }
+      else if (k === 3) { g.lineWidth = 10; for (let i = -6; i < 12; i++) { g.globalAlpha = i % 2 ? 0.3 : 0.9; g.beginPath(); g.moveTo(r.x + i * 30, r.y + r.h); g.lineTo(r.x + i * 30 + r.h, r.y); g.stroke(); } }
+      else if (k === 4) for (let i = 0; i < 12; i++) { const hh = 20 + ((i * 37) % 90); g.globalAlpha = 0.5 + 0.5 * ((i % 4) / 3); g.fillRect(r.x + 8 + i * ((r.w - 16) / 12), r.y + r.h - 8 - hh, (r.w - 16) / 12 - 5, hh); }
+      else { g.lineWidth = 7; for (let i = 0; i < 5; i++) { g.globalAlpha = 0.3 + 0.17 * i; g.strokeRect(r.x + 10 + i * 14, r.y + 10 + i * 9, r.w - 20 - i * 28, r.h - 20 - i * 18); } }
+      g.restore();
+    };
+    for (let k = 0; k < 6; k++) {
+      const r = place(260);
+      pat(k, r);
+      entries.push({ kind: 'led', text: `pattern${k}`, uv: [r.x / W, 1 - (r.y + r.h) / H, r.w / W, r.h / H], aspect: r.w / r.h });
+    }
+    for (const text of ['OPEN', '24H', 'OPEN 24H']) {
+      g.font = latin;
+      const tw = g.measureText(text).width;
+      const r = place(Math.ceil(tw + 70));
+      g.save();
+      g.fillStyle = 'rgba(255,255,255,0.1)';
+      g.fillRect(r.x + 4, r.y + 4, r.w - 8, r.h - 8);
+      g.strokeStyle = '#ffffff';
+      g.lineWidth = 5;
+      g.strokeRect(r.x + 9, r.y + 9, r.w - 18, r.h - 18);
+      g.fillStyle = '#ffffff';
+      g.textBaseline = 'middle';
+      g.textAlign = 'center';
+      g.fillText(text, r.x + r.w / 2, r.y + r.h / 2 + 4);
+      g.restore();
+      entries.push({ kind: 'led', text, uv: [r.x / W, 1 - (r.y + r.h) / H, r.w / W, r.h / H], aspect: r.w / r.h });
+    }
+  }
+  if (ext === true) {
+    // 16차 U7(S2): 상자 간판(라이트박스) — 바탕 색(파랑·보라·초록·남색, 붉은 주황 없음) + 흰 글자. 가로(panel)·세로(vbox)
+    const BG = ['#0b5578', '#432a86', '#1d6a30', '#26304f', '#5b2a78', '#0d6a66'];
+    x = 8;
+    y += 580;
+    SIGN_WORDS.forEach((text, i) => {
+      const bg = BG[i % BG.length];
+      g.font = `92px ${SIGNS.font}`;
+      const tw = fontOk ? g.measureText(text).width : 56 * text.length;
+      const r = place(Math.ceil(tw + 64));
+      g.save();
+      g.fillStyle = bg;
+      g.beginPath();
+      g.roundRect(r.x + 4, r.y + 4, r.w - 8, r.h - 8, 10);
+      g.fill();
+      g.strokeStyle = 'rgba(235, 240, 255, 0.55)';
+      g.lineWidth = 4;
+      g.stroke();
+      if (fontOk) {
+        g.fillStyle = '#ffffff';
+        g.textBaseline = 'middle';
+        g.textAlign = 'center';
+        g.fillText(text, r.x + r.w / 2, r.y + r.h / 2 + 5);
+      }
+      g.restore();
+      entries.push({ kind: 'panel', text, color: bg, uv: [r.x / W, 1 - (r.y + r.h) / H, r.w / W, r.h / H], aspect: r.w / r.h });
+    });
+    x = 8;
+    y += rowH + 10;
+    VERT.forEach((text, i) => {
+      const bg = BG[(i + 2) % BG.length];
+      const chars = text === 'PC방' ? ['PC', '방'] : [...text];
+      const cw = 130, ch = 120;
+      const w = cw, h = ch * chars.length + 26;
+      if (x + w > W - 8) { x = 8; y += 520; }
+      const r = { x, y, w, h };
+      x += w + 10;
+      g.save();
+      g.fillStyle = bg;
+      g.fillRect(r.x + 4, r.y + 4, r.w - 8, r.h - 8);
+      g.strokeStyle = 'rgba(235, 240, 255, 0.5)';
+      g.lineWidth = 4;
+      g.strokeRect(r.x + 6, r.y + 6, r.w - 12, r.h - 12);
+      if (fontOk) {
+        g.font = `${chars[0] === 'PC' ? 66 : 92}px ${SIGNS.font}`;
+        g.fillStyle = '#ffffff';
+        g.textBaseline = 'middle';
+        g.textAlign = 'center';
+        chars.forEach((c, k) => g.fillText(c, r.x + r.w / 2, r.y + 13 + ch * (k + 0.5) + 5));
+      }
+      g.restore();
+      entries.push({ kind: 'vbox', text, color: bg, uv: [r.x / W, 1 - (r.y + r.h) / H, r.w / W, r.h / H], aspect: r.w / r.h });
+    });
+  }
   const tex = new THREE.CanvasTexture(cv);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 4;
   tex.generateMipmaps = true;
-  return { tex, entries, fontOk };
+  return { tex, entries, fontOk, ext };
 }
 
 const BLANK = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1, THREE.RGBAFormat);
@@ -1286,10 +1647,15 @@ const XAX = new THREE.Vector3(1, 0, 0);
 // 12차: 코스가 2.4km 로 길어져 건물·가로수는 「카메라 가까운 것만 그리기」(NearWindow) — 전체 목록은 더 크게 둔다
 const MAX_CAR = 1500; // 12차 배7: 600 → 1500
 const CONE_SEARCH = 2; // 14차: 서치라이트 원뿔 수(아래 this.search 길이와 같게)
-const MAX = { building: 14000, struct: 2200, glow: 2600, sign: 900, barge: 16, cyl: 900, halo: 2200, refl: 2600, cone: 1200, car: MAX_CAR, tree: 4200 }; // 14차: cone 600 → 1200(가로등 원뿔 약 954 + 서치라이트 2 + 여유. 600 이면 넘친 만큼 그리기 오류·서치라이트 안 보임). 11차: refl 900 → 2600(바닥 빛웅덩이·젖은 노면 반사 띠), 차량 불빛 줄기 600, 간판 300 → 900, 가로수 1500
+// 16차 U7: 인스턴스 버퍼는 가장 큰 스테이지(S2 간판 골목)에 맞춤 — building 14000 → 24000, struct 2200 → 4000, glow 2600 → 3600, sign 900 → 5200, cyl 900 → 2400, halo 2200 → 4200, refl 2600 → 3600
+//   (S1 은 그대로 그 수만큼만 채운다 — 그리기 호출·삼각형은 count 로 정해진다). wire·stall 은 S2 전용 메시(alley.js)
+const S1_CAP = { sign: 900, cyl: 900 }; // 16차 U7: S1 이 옛 버퍼에서 꽉 차던 두 종류는 옛 상한을 지킨다(회귀 하네스 ①②③)
+// 16차 U7b(1-4): 버퍼 포화 0 — sign 5200 → 8000(S2 요청 약 6,900, 새 스테이지는 가까운 것만 그리기 650m), cyl 2400 → 3600, halo 4200 → 6000(애자 점 빛), struct 4000 → 9000(S3 고가 상판·교각), U8: refl 3600 → 5000(S3 땅 고속도로 가로등 빛 고임)
+const MAX = { building: 24000, struct: 9000, glow: 3600, sign: 8000, barge: 64, /* 16차 U10: 16 → 64(S5 바지선 피날레) */ cyl: 3600, halo: 6000, refl: 5000, cone: 1200, car: MAX_CAR, tree: 4200, wire: 4000, stall: 1600 }; // 14차: cone 600 → 1200(가로등 원뿔 약 954 + 서치라이트 2 + 여유. 600 이면 넘친 만큼 그리기 오류·서치라이트 안 보임). 11차: refl 900 → 2600(바닥 빛웅덩이·젖은 노면 반사 띠), 차량 불빛 줄기 600, 간판 300 → 900, 가로수 1500
 
 // 12차: 인스턴스 메시 「가까운 것만」 — 지은 뒤 전체 목록을 따로 두고, 카메라에서 R m 안의 인스턴스만 앞으로 모아 count 로 그린다
 // (그리기 호출은 그대로, 삼각형만 줄어듦). 카메라가 step m 넘게 움직이면 다시 모은다. attrs: 같이 옮길 인스턴스 속성들
+const _nearDir = new THREE.Vector3();
 class NearWindow {
   constructor(mesh, attrs, R = 800, step = 40) {
     this.mesh = mesh;
@@ -1298,6 +1664,7 @@ class NearWindow {
     this.step = step;
     this.n = 0;
     this.last = null;
+    this.view = null; // 16차 3-4 모바일: { cos, near, rMult } — 카메라 앞쪽 부채꼴(+ 가까운 원)만, 반지름 × rMult
   }
 
   snapshot(n) {
@@ -1310,15 +1677,21 @@ class NearWindow {
     this.last = null;
   }
 
-  update(x, z, force = false) {
+  update(x, z, force = false, fx = 0, fz = -1) {
     if (!this.master) return;
-    if (!force && this.last && Math.hypot(x - this.last[0], z - this.last[1]) < this.step) return;
-    this.last = [x, z];
-    const R2 = this.R * this.R;
+    const V = this.view;
+    const turned = V && this.last && (fx * this.last[2] + fz * this.last[3]) < V.turnCos;
+    if (!force && !turned && this.last && Math.hypot(x - this.last[0], z - this.last[1]) < this.step) return;
+    this.last = [x, z, fx, fz];
+    const R = V ? this.R * V.rMult : this.R;
+    const R2 = R * R;
+    const N2 = V ? V.near * V.near : 0;
     let k = 0;
     for (let i = 0; i < this.n; i++) {
       const dx = this.cx[i] - x, dz = this.cz[i] - z;
-      if (dx * dx + dz * dz > R2) continue;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > R2) continue;
+      if (V && d2 > N2 && dx * fx + dz * fz < V.cos * Math.sqrt(d2)) continue; // 모바일: 카메라 뒤·옆은 빼고 앞 부채꼴만
       for (let a = 0; a < this.attrs.length; a++) {
         const sz = this.attrs[a].itemSize;
         const src = this.master[a], dst = this.attrs[a].array;
@@ -1328,6 +1701,54 @@ class NearWindow {
     }
     this.mesh.count = k;
     for (const a of this.attrs) a.needsUpdate = true;
+    this.shown = k;
+  }
+}
+
+// 16차 U7: S2(도로가 많은 간판 골목) 데스크톱 — 방향은 따지지 않고 반지름 안 삼각형만(S1 데스크톱은 view 없음 그대로)
+const ROAD_VIEW_ALL = { cos: -2, turnCos: -2, near: 0, rMult: 1 };
+// 16차 3-4 모바일: 큰 땅·도로 띠(메시 하나)도 카메라 앞 부채꼴 안 삼각형만 인덱스 앞으로 모아 그린다(view 가 없으면 아무것도 안 함 — 데스크톱 그대로)
+class IndexWindow {
+  constructor(mesh, R = 900, step = 40) {
+    this.mesh = mesh;
+    this.R = R;
+    this.step = step;
+    const g = mesh.geometry;
+    this.index = g.index;
+    this.master = g.index.array.slice();
+    const P = g.attributes.position.array;
+    const n = this.master.length / 3;
+    this.n = n;
+    this.cx = new Float32Array(n);
+    this.cz = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = this.master[i * 3] * 3, b = this.master[i * 3 + 1] * 3, c = this.master[i * 3 + 2] * 3;
+      this.cx[i] = (P[a] + P[b] + P[c]) / 3;
+      this.cz[i] = (P[a + 2] + P[b + 2] + P[c + 2]) / 3;
+    }
+    this.view = null;
+    this.last = null;
+  }
+
+  update(x, z, fx, fz) {
+    const V = this.view;
+    if (!V) return;
+    const turned = this.last && (fx * this.last[2] + fz * this.last[3]) < V.turnCos;
+    if (!turned && this.last && Math.hypot(x - this.last[0], z - this.last[1]) < this.step) return;
+    this.last = [x, z, fx, fz];
+    const R2 = this.R * this.R, N2 = V.near * V.near;
+    const src = this.master, dst = this.index.array;
+    let k = 0;
+    for (let i = 0; i < this.n; i++) {
+      const dx = this.cx[i] - x, dz = this.cz[i] - z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > R2) continue;
+      if (d2 > N2 && dx * fx + dz * fz < V.cos * Math.sqrt(d2)) continue;
+      dst[k * 3] = src[i * 3]; dst[k * 3 + 1] = src[i * 3 + 1]; dst[k * 3 + 2] = src[i * 3 + 2];
+      k++;
+    }
+    this.mesh.geometry.setDrawRange(0, k * 3);
+    this.index.needsUpdate = true;
     this.shown = k;
   }
 }
@@ -1462,6 +1883,8 @@ export class World {
       this.trees.count = 0;
       this.group.add(this.trees);
     }
+    this.wires = null; // 16차 U7: S2 전용 전선·천막 메시는 S2 를 처음 지을 때 만든다(_ensureAlleyMeshes — three 의 uuid 가 Math.random 을 써서 S1 난수 흐름을 바꾸지 않게)
+    this.stalls = null;
     // 바지선(발사대)
     this.bargeMat = new THREE.MeshLambertMaterial({ color: 0x15161b });
     this.barges = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), this.bargeMat, MAX.barge);
@@ -1570,13 +1993,54 @@ export class World {
   }
 
   _makeAtlas() {
-    if (this.atlas && this.atlas.fontOk === this.fontOk) return;
+    const ext = this.alley ? true : this.canyon ? 'canyon' : false; // 16차 U7: S2 는 간판 칸을 더한 아틀라스(S1 은 15차 그대로 — 같은 그림) · U9: S4 는 LED 외벽 칸
+    if (this.atlas && this.atlas.fontOk === this.fontOk && (this.atlas.ext || false) === ext) return;
     if (this.atlas && this.atlas.tex) this.atlas.tex.dispose();
-    this.atlas = buildAtlas(this.fontOk);
+    this.atlas = buildAtlas(this.fontOk, ext);
     if (!this.atlas.tex) return;
     if (this.signs) {
       this.signs.material.uniforms.uAtlas.value = this.atlas.tex;
     }
+  }
+
+  // 16차 3-4: 모바일 카메라 far(하늘 구는 그 안으로 줄이고, 원경 카드·능선은 그 거리로 당겨 그린다)
+  setFar(far) {
+    const on = far < 1500;
+    // 모바일: 가까운 것만 그리기 창을 카메라 앞 부채꼴(±75°, 60m 안은 모두)로, 반지름은 far 에 맞춰 0.85 배
+    this.nearView = on ? { cos: Math.cos((75 * Math.PI) / 180), turnCos: Math.cos((15 * Math.PI) / 180), near: 60, rMult: 0.85 } : null;
+    for (const w of [this.nearB, this.nearT, this.nearC, this.nearS, this.nearSt, ...(this.nearI || []), ...(this.nearX || [])]) if (w) { w.view = this.nearView; w.last = null; }
+    if (this.nearI && (this.noWater || this.river5) && !this.nearView) for (const w of this.nearI) w.view = ROAD_VIEW_ALL; // 16차 U7: S2(U8: S3) 데스크톱도 도로 띠는 900m 안만
+    this.sky.scale.setScalar(on ? (far * 0.95) / 1500 : 1);
+    this.farCardMat.uniforms.uClampD.value = on ? far : 1e9;
+    this.ridgeMat.uniforms.uClampD.value = on ? far : 1e9;
+  }
+
+  // 16차 U7: S2 전용 — 전선(띠 6마디)·야시장 천막(처음 S2 를 지을 때 한 번)
+  _ensureAlleyMeshes() {
+    if (this.wires) return;
+      const P = [];
+      const I = [];
+      for (let k = 0; k <= 6; k++) P.push(k / 6, -1, 0, k / 6, 1, 0);
+      for (let k = 0; k < 6; k++) { const a = k * 2; I.push(a, a + 2, a + 1, a + 1, a + 2, a + 3); }
+      const wg = new THREE.BufferGeometry();
+      wg.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+      wg.setIndex(I);
+      this.wireA = new THREE.InstancedBufferAttribute(new Float32Array(MAX.wire * 4), 4);
+      this.wireB = new THREE.InstancedBufferAttribute(new Float32Array(MAX.wire * 4), 4);
+      wg.setAttribute('aA', this.wireA);
+      wg.setAttribute('aB', this.wireB);
+      this.wireMat = makeWireMaterial(this.shared);
+      this.wires = new THREE.InstancedMesh(wg, this.wireMat, MAX.wire);
+      this.wires.frustumCulled = false;
+      this.wires.count = 0;
+      this.wires.visible = false;
+      this.group.add(this.wires);
+      this.stalls = new THREE.InstancedMesh(makeStallGeometry(), makeStallMaterial(this.shared), MAX.stall);
+      this.stalls.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(MAX.stall * 3), 3);
+      this.stalls.frustumCulled = false;
+      this.stalls.count = 0;
+      this.stalls.visible = false;
+      this.group.add(this.stalls);
   }
 
   setLowSpec(low) {
@@ -1615,7 +2079,7 @@ export class World {
   }
 
   get crowdGroundY() {
-    return 1.25;
+    return this.noWater ? 0.17 : 1.25; // 16차 U7: S2(U8: S3) 는 보도(연석 0.15m) 위 — 옥상 테라스·육교는 crowdY(사람마다 높이)
   }
 
   // ---------- 스테이지 짓기(6차 도시 배치) ----------
@@ -1624,29 +2088,34 @@ export class World {
   build(stage, course) {
     this.stage = stage;
     this.course = course;
+    this.kit = stage.kit || {}; // 16차 U6a: 구역 → 건물 생성기 표
+    const L = stage.city; // 16차 U6a: 하늘·안개·등·군중·장식 색
     const sh = this.shared;
-    sh.uFogColor.value.set(stage.fog.color);
-    sh.uFogDensity.value = stage.fog.density;
-    sh.uCityGlow.value.set(stage.cityGlow);
-    this.fog.color.set(stage.fog.color);
-    this.fog.density = stage.fog.density;
+    sh.uFogColor.value.set(L.fog.color);
+    sh.uFogDensity.value = L.fog.density;
+    sh.uCityGlow.value.set(L.cityGlow);
+    this.fog.color.set(L.fog.color);
+    this.fog.density = L.fog.density;
     const sk = this.skyMat.uniforms;
-    sk.uTop.value.set(stage.sky.top);
-    sk.uBottom.value.set(stage.sky.bottom);
+    sk.uTop.value.set(L.sky.top);
+    sk.uBottom.value.set(L.sky.bottom);
     const g = this.groundMat.uniforms;
-    g.uWaterCol.value.set(stage.groundColor);
-    g.uLandCol.value.set(stage.landColor).multiplyScalar(0.6);
-    g.uSkyLow.value.set(stage.sky.bottom);
-    g.uSkyTop.value.set(stage.sky.top);
-    g.uLamp.value.set(stage.lampColor);
-    this.ribbonMat.uniforms.uLamp.value.set(stage.lampColor);
-    this.roadMat.uniforms.uLamp.value.set(stage.lampColor);
-    this.roadMat.uniforms.uSkyLow.value.set(stage.sky.bottom);
+    g.uWaterCol.value.set(L.groundColor);
+    g.uLandCol.value.set(L.landColor).multiplyScalar(0.6);
+    g.uSkyLow.value.set(L.sky.bottom);
+    g.uSkyTop.value.set(L.sky.top);
+    g.uLamp.value.set(L.lampColor);
+    this.ribbonMat.uniforms.uLamp.value.set(L.lampColor);
+    { const ww = L.warmWin || [1.0, 0.6, 0.3]; this.buildingMat.uniforms.uWarmWin.value.set(ww[0], ww[1], ww[2]); this.buildingMat.uniforms.uGuard.value = L.roGuard ? 1 : 0; } // 16차 U8
+    { const cu = this.carMesh.material.uniforms; const tc = L.carTail || [0.5, 0.06, 0.03]; cu.uTail.value.set(tc[0], tc[1], tc[2]); cu.uBrakeK.value = L.brakeK ?? 1.6; } // 16차 U8: 꼬리등(S1 15차 그대로)
+    this.roadMat.uniforms.uLamp.value.set(L.lampColor);
+    this.roadMat.uniforms.uSkyLow.value.set(L.sky.bottom);
 
     this.launchers = [];
     this.crowdSpots = [];
     this.cars = [];
     this.avLights = [];
+    this.avCol = L.avColor || [0.55, 0.02, 0.05]; // 16차 U7b: 항공등 색(S1 진홍 그대로, 새 스테이지는 city.avColor — 붉은 주황은 위험 전용)
     this._crossN = 0;
     this.crosses = 0;
     this._signRefl = false;
@@ -1658,24 +2127,76 @@ export class World {
     this._hi = 0;
     this._ri = 0;
     this._ki = 0;
+    this._wi = 0;
+    this._sti = 0;
+    this._req = {}; // 16차 U7b: 인스턴스 버퍼 요청 수(bufferReport)
+    this._tag = null; // 16차 U8b: 생성기 이름표(점검 도구가 그 생성기만 끄고 다시 그려 화소 차이를 잰다). 새 스테이지 생성기만 붙인다 — 난수·그림과 무관
+    this.tagIdx = {};
     this.search = [];
     this.structOf = [];
     this.cylOf = [];
     this.signList = [];
     this.lines = []; // 선형 구조물(도로·다리): { name, pts: [[x, y, z], …], half, kind }
     this.lots = []; // 건물 바닥(점검·발사대)
+    // 16차 U7: S2 간판 골목(kit.style 'alley') — 강·강둑·다리 없이 평지(지형 높이 0). 도로·건물·간판·전선·천막·군중은 alley.js
+    const alley = this.kit.style === 'alley';
+    const over = this.kit.style === 'overpass'; // 16차 U8: S3 고가 교차로(overpass.js) — 강 없는 평지, 전차선은 S2 전선 메시
+    const canyon = this.kit.style === 'canyon'; // 16차 U9: S4 유리 협곡(canyon.js) — 강 없는 평지
+    const river5 = this.kit.style === 'riverside'; // 16차 U10: S5 강변 불꽃축제(riverside.js) — S1 강 2개 틀(지류·본류) 위에 새 배치
+    this.alley = alley;
+    this.over = over;
+    this.canyon = canyon;
+    this.river5 = river5;
+    { const gt = L.glassTint || [0, 0, 0, 0]; this.buildingMat.uniforms.uGlassTint.value.set(gt[0], gt[1], gt[2], gt[3]); } // 16차 U10(gate16s4 권고 a): S4 유리 탑 색조·층 띠(다른 스테이지 0 — 그림 그대로)
+    this.noWater = alley || over || canyon;
+    this.extraTrees = null;
+    this.infra = null;
+    this.infraCross = null;
+    this.overpassStats = null;
+    this.alleySearch = null;
+    this.crowdY = null;
+    this.alleyStats = null;
+    this.canyonStats = null;
+    this.riversideStats = null;
+    if (alley || over || river5) this._ensureAlleyMeshes(); // 16차 U10: S5 는 축제 천막·등 줄
+    if (this.wires) { this.wires.visible = false; this.wires.count = 0; this.stalls.visible = false; this.stalls.count = 0; }
+    // 16차 U11(2-7 메모리): 전선·천막을 쓰지 않는 스테이지(S1·S4)에서는 GPU 버퍼를 놓아 준다 — 다시 쓰면 three 가 배열에서 새로 올린다
+    if (this.wires && !(alley || over || river5)) { this.wires.geometry.dispose(); this.stalls.geometry.dispose(); }
+    this.nearX = [];
+    this.barges.visible = !this.noWater;
+    this.bargeMat.color.set(L.bargeColor ?? 0x15161b); // 16차 U10: S5 바지선은 밝은 회색 선체(S1 그대로)
 
-    this._layout();
+    if (alley || over || canyon) {
+      this.rivers = [];
+      this.main = null;
+      this.trib = null;
+      this.bridgeA = null;
+      this.bridgeB = null;
+      this.towers = [];
+    } else this._layout();
     this._buildMask();
     this._buildOcc();
-    this._buildRibbons();
-    this._buildRoads();
-    this._buildBridges();
-    this._buildCity();
+    if (alley) {
+      if (this.ribbon) { this.group.remove(this.ribbon); this.ribbon.geometry.dispose(); this.ribbon = null; }
+      buildAlley(this, MAX);
+    } else if (over) {
+      if (this.ribbon) { this.group.remove(this.ribbon); this.ribbon.geometry.dispose(); this.ribbon = null; }
+      buildOverpass(this, MAX);
+    } else if (canyon) {
+      if (this.ribbon) { this.group.remove(this.ribbon); this.ribbon.geometry.dispose(); this.ribbon = null; }
+      buildCanyon(this, MAX);
+    } else if (river5) {
+      buildRiverside(this, MAX); // 강둑 띠·강변도로·다리 C·D·아파트·둔치 공원·바지선·축제 군중
+    } else {
+      this._buildRibbons();
+      this._buildRoads();
+      this._buildBridges();
+      this._buildCity();
+    }
     this._buildFar();
     this._buildRidge();
     this._buildFarCards();
-    this._buildBarges();
+    if (!this.noWater && !river5) this._buildBarges(); // 16차 U10: S5 바지선은 riverside.js(지류·본류 피날레)
     this._buildLamps();
     this._buildCars();
     this._buildTrees();
@@ -1687,16 +2208,36 @@ export class World {
     this.buildings.count = this._bi;
     this.buildings.instanceMatrix.needsUpdate = true;
     this.infoAttr.needsUpdate = true;
-    this.nearB = new NearWindow(this.buildings, [this.infoAttr], 650);
+    this.nearB = new NearWindow(this.buildings, [this.infoAttr], alley || over || river5 ? 560 : 650); // 16차 U10: S5 도 560m(안개 0.0026, 삼각형 예산) // 16차 U9: S4 는 650m(유리 탑·협곡 벽이 멀리서 보이게, 안개 0.0016) // 16차 U8: S3 도 560m(삼각형 예산) // 16차 U7: S2 는 건물이 촘촘하고 안개가 짙어(0.0024) 560m
     this.nearB.snapshot(this._bi);
     if (this.trees) { this.nearT = new NearWindow(this.trees, this.trees.instanceColor ? [this.trees.instanceColor] : [], 420); this.nearT.snapshot(this.trees.count); }
     // 12차: 옥상 물탱크(원통)도 가까운 것만(600m)
-    this.nearC = new NearWindow(this.cyls, [this.cyls.instanceColor, this.cylFE], 600);
+    this.nearC = new NearWindow(this.cyls, [this.cyls.instanceColor, this.cylFE], alley ? 420 : this.kit.style ? 650 : 600); // 16차 U7b: S2 는 420m(옥상 물탱크가 많아 삼각형 예산) · U8: S3 는 교각이 멀리서도 보이게 650m
     this.nearC.snapshot(this._ci);
+    // 16차 U7: S2 전선(카메라 420m 안)·천막(500m 안)도 가까운 것만 — U8: S3 전차선도
+    if (alley || over || river5) {
+      this.wires.instanceMatrix.needsUpdate = true;
+      this.stalls.instanceMatrix.needsUpdate = true;
+      this.stalls.instanceColor.needsUpdate = true;
+      const nw = new NearWindow(this.wires, [this.wireA, this.wireB], 420);
+      nw.snapshot(this._wi);
+      const ns = new NearWindow(this.stalls, [this.stalls.instanceColor], 500);
+      ns.snapshot(this._sti);
+      this.nearX = [nw, ns];
+      this.wires.visible = this._wi > 0;
+      this.stalls.visible = this._sti > 0;
+    }
+    for (const w of [this.nearB, this.nearT, this.nearC]) if (w) w.view = this.nearView || null;
+    this.nearI = [this.ribbon, this.roads].filter(Boolean).map((m) => new IndexWindow(m, alley ? 900 : 1000));
+    for (const w of this.nearI) w.view = this.nearView || (this.noWater || river5 ? ROAD_VIEW_ALL : null); // 16차 U10: S5 도 데스크톱 도로·강둑 띠는 1,000m 안만(강·도로가 길어 삼각형 예산)
+    for (const w of this.nearX) w.view = this.nearView || null;
     this.structs.count = this._si;
     this.structs.instanceMatrix.needsUpdate = true;
     this.structs.instanceColor.needsUpdate = true;
     this.feAttr.needsUpdate = true;
+    // 16차 U8: S3 은 구조물(고가 상판·교각 머리·요금소)이 많아 가까운 것만(1,000m — 안개 0.002 에서 남는 밝기 2% 아래, 모바일은 앞 부채꼴). 가림 처리(structOf)가 없는 스테이지만
+    this.nearSt = null;
+    if (over || canyon || river5) { this.nearSt = new NearWindow(this.structs, [this.structs.instanceColor, this.feAttr], 1000); this.nearSt.snapshot(this._si); this.nearSt.view = this.nearView || null; }
     this.glowStatic = this._gi;
     this.haloStatic = this._hi;
     this.coneStatic = this._ki;
@@ -1712,9 +2253,9 @@ export class World {
     this.cylFE.needsUpdate = true;
     this.barges.count = this._bai;
     this.barges.instanceMatrix.needsUpdate = true;
-    // 축제 서치라이트 2개(지류 양쪽 둔치에서 하늘로, 천천히 돈다)
+    // 축제 서치라이트 2개(지류 양쪽 둔치에서 하늘로, 천천히 돈다) — 16차 U7: S2 는 alley.js 가 정한 자리(야시장·광장)
     const T = CITY.trib;
-    this.search = [
+    this.search = this.noWater ? this.alleySearch || [] : [
       { x: T.x - T.hw - 8, z: 120, ph: Math.random() * 6.28, side: -1 },
       { x: T.x + T.hw + 8, z: -260, ph: Math.random() * 6.28, side: 1 },
     ];
@@ -1730,8 +2271,10 @@ export class World {
     const th = last.th;
     const fx = Math.sin(th), fz = -Math.cos(th);
     const p0 = C.xz(last.a, K.main.off, {});
-    const start = { x: p0.x - fx * K.main.back, z: p0.z - fz * K.main.back, th };
-    this.main = { path: new Path2D([[K.main.back + K.main.ahead, 0]], start, 0, 2), hw: K.main.hw, fx, fz, rx: Math.cos(th), rz: Math.sin(th) };
+    const RV = (this.kit && this.kit.river) || {}; // 16차 U10: S5 는 본류를 앞으로 더 길게(kit.river.ahead) — S1 은 CITY 그대로
+    const back = RV.back ?? K.main.back, ahead = RV.ahead ?? K.main.ahead;
+    const start = { x: p0.x - fx * back, z: p0.z - fz * back, th };
+    this.main = { path: new Path2D([[back + ahead, 0]], start, 0, 2), hw: K.main.hw, fx, fz, rx: Math.cos(th), rz: Math.sin(th) };
     // 지류: x = trib.x, 북쪽(+Z)에서 −Z 로 본류 중심선까지
     const t = (K.trib.x - p0.x) / fx;
     const zc = p0.z + fz * t;
@@ -1756,6 +2299,7 @@ export class World {
 
   // 물가에서 거리(물 안은 −). 지류는 본류 안쪽 끝까지만
   bankDist(x, z) {
+    if (this.noWater) return 1e4; // 16차 U7: S2 간판 골목은 강이 없다(지형 높이 0)
     const m = this._mainUV(x, z);
     let d = Math.abs(m.u) - this.main.hw;
     const T = this.trib;
@@ -2019,7 +2563,7 @@ export class World {
     // 5 대로: 지류 서쪽 강변도로(z = −140) → 코스 s 180~485 → 곧게 본류 도심 쪽 강변도로까지
     {
       const pts = [];
-      const s180 = remapS(180), s485 = remapS(485);
+      const s180 = remapS(180, C.def), s485 = remapS(485, C.def);
       const p180 = C.xz(s180, 0, {});
       pts.push(P3(xW, p180.z));
       for (let s = s180; s <= s485; s += 5) {
@@ -2041,22 +2585,23 @@ export class World {
     }
     // 6 다리 A(지류, s 45) + 양쪽 경사로 + 거리(동서로 1.5km 밖까지)
     {
-      const ps = C.xz(COURSE.bridges[0].s, 0, {});
+      const ps = C.xz(C.bridges[0].s, 0, {});
       const z = ps.z;
-      const top = COURSE.bridges[0].underside + 1.2;
+      const top = C.bridges[0].underside + 1.2;
       const xa = Tx - T.hw - 15;
       const xb = Tx + T.hw + 15;
       const ramp = top / K.rampGrade;
       const pts = [P3(-far - 500, z), P3(xa - ramp, z), [xa, top, z], [xb, top, z], P3(xb + ramp, z), P3(far + Tx, z)];
-      this.bridgeA = { z, xa, xb, top, ramp };
+      // 15차: 시작 횃대 = 출발 쪽(+z) 트러스 윗현 LED 띠 위(윗현 yt = top + 8.5, 두께 0.6 · LED 0.42 위 0.18)
+      this.bridgeA = { z, xa, xb, top, ramp, perchZ: z + 6.6, perchY: top + 8.5 + 0.42 + 0.09 };
       this._addLine('다리 A 와 동서 거리', pts, 7, 'bridge');
     }
     // 7 다리 B(본류, s 775) + 경사로: 도심 쪽은 지류 서쪽 강변도로에 붙고, 건너편은 1.5km 밖까지
     {
-      const ps = C.xz(COURSE.bridges[1].s, 0, {});
+      const ps = C.xz(C.bridges[1].s, 0, {});
       const uv = this._mainUV(ps.x, ps.z);
       const sB = uv.s;
-      const top = COURSE.bridges[1].underside + 1.2;
+      const top = C.bridges[1].underside + 1.2;
       const ua = -(M.hw + 15);
       const ub = M.hw + 15;
       const ramp = top / 0.12; // 도심 쪽은 짧은 경사로(12%)
@@ -2076,12 +2621,12 @@ export class World {
     {
       const zA = this.bridgeA.z;
       for (const s0 of [400, 462]) {
-        const s = remapS(s0);
+        const s = remapS(s0, C.def);
         const p = C.xz(s, 0, {});
         this._addLine(`골목 북 s${s}`, [P3(p.x, p.z), P3(p.x, zA)], 4.5);
       }
       for (const s0 of [250, 420]) {
-        const s = remapS(s0);
+        const s = remapS(s0, C.def);
         const p = C.xz(s, 0, {});
         // 본류 쪽(−u 방향 아님: 지도에서 본류 도심쪽 도로까지 곧게 −Z)
         const uv = this._mainUV(p.x, p.z);
@@ -2092,8 +2637,8 @@ export class World {
   }
 
   // 도로 그리기(땅 띠와 따로 — 겹침 깜빡임 방지용 polygonOffset)
-  _buildRoads() {
-    this._layoutRoads();
+  _buildRoads(layout = true) {
+    if (layout) this._layoutRoads(); // 16차 U7: S2 는 alley.js 가 선을 먼저 넣고 layout = false 로 부른다
     if (this.roads) {
       this.group.remove(this.roads);
       this.roads.geometry.dispose();
@@ -2113,8 +2658,10 @@ export class World {
       const W = L.walk;
       const ck = 0.15; // 연석 높이
       // 11차 배1: [중심에서 거리, 높이, 색] — 인도 바깥 · 연석 위 · 연석 아래(단) · 차도 · 반대편
-      const prof = [[-L.half - W, ck, walk], [-L.half, ck, walk], [-L.half, 0, asph], [L.half, 0, asph], [L.half, ck, walk], [L.half + W, ck, walk]];
-      const kindN = L.kind === 'avenue' ? 1 : L.kind === 'bridge' ? 2 : 0;
+      // 16차 U7: simple = 연석 단 없이 4점(골목·광장 — 삼각형 40% 덜), 종류 3 = 노면 표시 없음
+      const prof = L.simple ? [[-L.half - W, ck, walk], [-L.half, 0, asph], [L.half, 0, asph], [L.half + W, ck, walk]]
+        : [[-L.half - W, ck, walk], [-L.half, ck, walk], [-L.half, 0, asph], [L.half, 0, asph], [L.half, ck, walk], [L.half + W, ck, walk]];
+      const kindN = L.kind === 'avenue' ? 1 : L.kind === 'bridge' ? 2 : L.kind === 'alley' ? 3 : 0;
       let prev = null;
       for (let i = 0; i < pts.length; i++) {
         const p = pts[i];
@@ -2215,9 +2762,47 @@ export class World {
     return _m.compose(_p, _q, _s);
   }
 
+  // 16차 U7b(1-4): 인스턴스 버퍼 요청 수(넘쳐서 소리 없이 빠지는 것을 점검이 잡게 — 세기만 하고 그림·난수에는 영향 없음)
+  _rq(k) {
+    const r = this._req || (this._req = {});
+    r[k] = (r[k] || 0) + 1;
+  }
+
+  // 16차 U8b: 지금 이름표(this._tag)가 있으면 버퍼 buf 의 인스턴스 i 를 그 이름표 목록에 적는다(tagIdx['buf:tag'])
+  _tg(buf, i) {
+    if (!this._tag || i < 0) return;
+    const k = buf + ':' + this._tag;
+    (this.tagIdx[k] || (this.tagIdx[k] = [])).push(i);
+  }
+
+  // 버퍼마다 { req 요청, cap 용량, used 실제 } — 포화 = req > cap. S1 은 15차 상한(S1_CAP)을 지키는 알려진 예외가 있다
+  bufferReport() {
+    const r = this._req || {};
+    const s1 = !this.kit || !this.kit.style;
+    const signCap = s1 ? S1_CAP.sign : MAX.sign;
+    const rows = {
+      building: { req: r.building || 0, cap: MAX.building, used: this._bi },
+      struct: { req: r.struct || 0, cap: MAX.struct, used: this._si },
+      cyl: { req: r.cyl || 0, cap: s1 ? S1_CAP.cyl : MAX.cyl, used: this._ci },
+      glow: { req: r.glow || 0, cap: MAX.glow, used: this._gi },
+      halo: { req: r.halo || 0, cap: MAX.halo, used: Math.min(this._hi, MAX.halo) },
+      refl: { req: r.refl || 0, cap: MAX.refl, used: this._ri },
+      cone: { req: r.cone || 0, cap: MAX.cone - CONE_SEARCH, used: this._ki },
+      wire: { req: r.wire || 0, cap: MAX.wire, used: this._wi || 0 },
+      stall: { req: r.stall || 0, cap: MAX.stall, used: this._sti || 0 },
+      sign: { req: Math.max(this.signList.length, r.sign || 0), cap: signCap, used: this.signN ?? Math.min(this.signList.length, signCap) },
+      car: { req: this.carReq || 0, cap: MAX.car, used: this.carCount || 0 },
+      tree: { req: this.treeReq || 0, cap: MAX.tree, used: this.treeCount || 0 },
+    };
+    for (const k of Object.keys(rows)) rows[k].sat = rows[k].req > rows[k].cap;
+    return rows;
+  }
+
   _addStructW(x, y, z, yaw, sx, sy, sz, color, emis = 0, tilt = 0, roll = 0) {
+    this._rq('struct');
     if (this._si >= MAX.struct) return;
     const i = this._si++;
+    this._tg('struct', i);
     this.structs.setMatrixAt(i, this._worldMatrix(x, y, z, yaw, sx, sy, sz, tilt, roll));
     _c.set(color);
     this.structs.setColorAt(i, _c);
@@ -2226,8 +2811,10 @@ export class World {
   }
 
   _addCylW(x, y, z, sx, sy, sz, color, emis = 0, yaw = 0) {
-    if (this._ci >= MAX.cyl) return;
+    this._rq('cyl');
+    if (this._ci >= (this.kit && this.kit.style ? MAX.cyl : S1_CAP.cyl)) return; // 16차 U7: S1 은 15차 상한 그대로(같은 그림·같은 난수 흐름)
     const i = this._ci++;
+    this._tg('cyl', i);
     this.cyls.setMatrixAt(i, this._worldMatrix(x, y, z, yaw, sx, sy, sz));
     _c.set(color);
     this.cyls.setColorAt(i, _c);
@@ -2236,8 +2823,10 @@ export class World {
   }
 
   _addBuildingWorld(x, z, yaw, w, d, h, kind, lit, gain = 1, base = 0, seed = null) {
+    this._rq('building');
     if (this._bi >= MAX.building) return -1;
     const i = this._bi++;
+    this._tg('building', i);
     _p.set(x, base, z);
     _q.setFromAxisAngle(UP, yaw);
     _s.set(w, h, d);
@@ -2248,6 +2837,7 @@ export class World {
 
   _addCone(x, y, z, h, r, col, a = 1, i = -1, tiltX = 0, tiltZ = 0) {
     // 14차: 고정 원뿔은 서치라이트 자리(CONE_SEARCH)를 남기고 한도에서 멈춘다(넘쳐도 _ki 를 올리지 않음)
+    if (i < 0) this._rq('cone', MAX.cone - CONE_SEARCH);
     if (i < 0 && this._ki >= MAX.cone - CONE_SEARCH) return -1;
     const k = i >= 0 ? i : this._ki++;
     if (k >= MAX.cone) return -1;
@@ -2260,6 +2850,7 @@ export class World {
   }
 
   _addRefl(x, z, len, w, col) {
+    this._rq('refl');
     if (this._ri >= MAX.refl) return;
     const i = this._ri++;
     this.reflP.setXYZW(i, x, z, len, w);
@@ -2268,6 +2859,7 @@ export class World {
 
   // 11차 배1: 바닥 빛웅덩이(가로등 자리) — 수면 반사 쿼드와 같은 인스턴스(그리기 호출 늘지 않음). 종류 표시 = 세기 칸 4 + 높이/2
   _addPool(x, y, z, r, col) {
+    this._rq('refl');
     if (this._ri >= MAX.refl) return;
     const i = this._ri++;
     this.reflP.setXYZW(i, x, z, 0, r);
@@ -2276,6 +2868,7 @@ export class World {
 
   // 11차 배1: 젖은 노면 위 가짜 반사 띠(카메라 쪽으로 늘어남, 물 마스크 없이). 종류 표시 = 2 + 높이/4
   _addRoadRefl(x, y, z, len, w, col) {
+    this._rq('refl');
     if (this._ri >= MAX.refl) return;
     const i = this._ri++;
     this.reflP.setXYZW(i, x, z, len, w);
@@ -2283,16 +2876,43 @@ export class World {
   }
 
   _addHalo(x, y, z, size, col, a = 1, i = -1) {
+    if (i < 0) this._rq('halo');
     const k = i >= 0 ? i : this._hi++;
     if (k >= MAX.halo) return -1;
+    if (i < 0) this._tg('halo', k);
     this.haloP.setXYZW(k, x, y, z, size);
     this.haloC.setXYZW(k, col[0], col[1], col[2], a);
     return k;
   }
 
+  // 16차 U7(S2): 전선 하나(A → B, 처짐 sag, 굵기 w) · 천막 하나
+  _addWire(a, b, sag, w) {
+    this._rq('wire');
+    if (this._wi >= MAX.wire) return -1;
+    const i = this._wi++;
+    this._tg('wire', i);
+    this.wireA.setXYZW(i, a[0], a[1], a[2], sag);
+    this.wireB.setXYZW(i, b[0], b[1], b[2], w);
+    _m.makeTranslation((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2);
+    this.wires.setMatrixAt(i, _m);
+    return i;
+  }
+
+  _addStall(x, y, z, yaw, col, sc = 1) {
+    this._rq('stall');
+    if (this._sti >= MAX.stall) return -1;
+    const i = this._sti++;
+    this.stalls.setMatrixAt(i, this._worldMatrix(x, y, z, yaw, sc, sc, sc));
+    _c.setRGB(col[0], col[1], col[2]);
+    this.stalls.setColorAt(i, _c);
+    return i;
+  }
+
   _addGlow(x, y, z, sx, sy, sz, col, yaw = 0) {
+    this._rq('glow');
     if (this._gi >= MAX.glow) return -1;
     const i = this._gi++;
+    this._tg('glow', i);
     _p.set(x, y, z);
     _q.setFromAxisAngle(UP, yaw);
     _s.set(sx, sy, sz);
@@ -2396,10 +3016,239 @@ export class World {
       }
     };
     const A = this.bridgeA;
+    const tg = this.river5; // 16차 U10: S5 다리 C·D 는 이름표(점검 도구가 다리만 끄고 화소 차이를 잰다 — 난수·그림 무관). S1 은 그대로
+    if (tg) this._tag = 'bridgeC';
     mk(0, 0, A.z, 1, 0, A.xa, A.xb, A.top, A.ramp, A.ramp);
     const B = this.bridgeB;
     const o = this._mainXZ(B.s, 0);
+    if (tg) this._tag = 'bridgeD';
     mk(1, o.x, o.z, this.main.rx, this.main.rz, B.ua, B.ub, B.top, B.rampS, B.ramp);
+    if (tg) this._tag = null;
+  }
+
+  // ---------- 15차 A-2: 건물 상한 세 띠 ----------
+  // 그 s 둘레(± hd) 통로 중심의 최솟값(경사로에서 건물 끝이 더 낮은 바닥 위에 걸리지 않게)
+  _cvMin(s, hd = 0) {
+    const C = this.course;
+    let cv = Infinity;
+    for (let k = -2; k <= 2; k++) cv = Math.min(cv, C.center(Math.max(C.sMin, Math.min(C.sMax, s + (k * hd) / 2))));
+    return cv;
+  }
+
+  // 16차 U7b/U8: 새 스테이지용 「모든 코스 구간」 상한 — 가장 가까운 점 하나가 아니라 코스 4m 마다(capS 안) 그 거리의 띠 상한 중 가장 낮은 값.
+  //   코스가 자기 곁을 지나는 곳(S3 의 440m 구간 등)·경사·회전 안쪽에서도 지붕(body)·지붕 + 소품(prop)이 통로 바닥 아래. edge = 가장 가까운 거리 − hd
+  //   (S1 은 쓰지 않는다 — 15차 그대로)
+  capAllAt(x, z, hd = 0) {
+    const C = this.course;
+    if (!this._capSm || this._capSm.C !== C) {
+      const capS = C.def.capS;
+      const cell = 60;
+      const G = new Map();
+      const p = {};
+      for (let s = Math.max(capS[0], C.sMin); s <= Math.min(capS[1], C.sMax); s += 4) {
+        C.at(s, p);
+        const q = { x: p.x, z: p.z, fx: Math.sin(p.th), fz: -Math.cos(p.th), cv: C.center(s), s };
+        const k = `${Math.floor(q.x / cell)},${Math.floor(q.z / cell)}`;
+        if (!G.has(k)) G.set(k, []);
+        G.get(k).push(q);
+      }
+      this._capSm = { C, G, cell, capS };
+    }
+    const { G, cell, capS } = this._capSm;
+    const K = CITY.cap;
+    const R = K.mid + hd + 4;
+    let body = Infinity, prop = Infinity, edgeMin = Infinity;
+    const i0 = Math.floor((x - R) / cell), i1 = Math.floor((x + R) / cell), j0 = Math.floor((z - R) / cell), j1 = Math.floor((z + R) / cell);
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+      const a = G.get(`${i},${j}`);
+      if (!a) continue;
+      for (const q of a) {
+        const dx = x - q.x, dz = z - q.z;
+        const sE = q.s + dx * q.fx + dz * q.fz; // 그 표본 앞뒤로 capS 밖이면 뺀다(코스 끝 「그대로」 구간)
+        if (!(sE > capS[0] && sE < capS[1])) continue;
+        const edge = Math.hypot(dx, dz) - hd;
+        if (edge > K.mid) continue;
+        edgeMin = Math.min(edgeMin, edge);
+        if (edge <= K.near) { body = Math.min(body, q.cv - K.drop); prop = Math.min(prop, q.cv - ELLIPSE.v - K.propGap); }
+        else body = Math.min(body, q.cv - K.drop + K.slope * (edge - K.near));
+      }
+    }
+    return { body, prop, edge: edgeMin };
+  }
+
+  // 지붕 상한(세계 높이). edge = 경로에서 건물 모서리까지(m). 먼 띠·코스 밖은 Infinity
+  _capTop(s, edge, hd = 0) {
+    const K = CITY.cap;
+    const capS = this.course.def.capS; // 16차 U6a: 상한을 거는 s 범위는 코스 정의
+    if (!(s > capS[0] && s < capS[1])) return Infinity;
+    const cv = this._cvMin(s, hd);
+    if (edge <= K.near) return cv - K.drop;
+    if (edge <= K.mid) return cv - K.drop + K.slope * (edge - K.near);
+    return Infinity;
+  }
+
+  // 가까운 띠 옥상 소품 최고점 상한 = 통로 바닥 − 1m
+  _propTop(s, hd = 0) {
+    return this._cvMin(s, hd) - ELLIPSE.v - CITY.cap.propGap;
+  }
+
+  // 가까운 띠 블록 계단표(좌우 따로): [s 시작, s 끝, 높은 블록?]
+  _makeBlocks() {
+    const B = CITY.block;
+    const mk = () => {
+      const a = [];
+      let s = -420;
+      let hi = Math.random() < 0.5;
+      while (s < 3200) {
+        const L = rand(B.len[0], B.len[1]);
+        a.push([s, s + L, hi]);
+        s += L;
+        hi = !hi;
+      }
+      return a;
+    };
+    this.blocks = [mk(), mk()];
+  }
+
+  _blockHigh(s, side) {
+    const a = this.blocks[side > 0 ? 1 : 0];
+    for (const b of a) if (s < b[1]) return b[2];
+    return false;
+  }
+
+  // 옆 탑 바닥(위협 발사 자리 후보에서 뺀다)
+  inTower(x, z, pad = 0) {
+    for (const t of this.towers || []) {
+      const dx = x - t.x, dz = z - t.z;
+      const lx = dx * Math.cos(t.yaw) - dz * Math.sin(t.yaw);
+      const lz = dx * Math.sin(t.yaw) + dz * Math.cos(t.yaw);
+      if (Math.abs(lx) <= t.w / 2 + pad && Math.abs(lz) <= t.d / 2 + pad) return true;
+    }
+    return false;
+  }
+
+  // 15차: 옆 탑(구간마다 2~4개, edge 25~60m, 지붕 = 통로 중심 + 10~20m) + 회전 구간 바깥쪽 랜드마크(첨탑·전광판 탑)
+  //   강 구간은 강변도로 때문에 60m 안에 땅이 없어 66m 까지 허용(가장 가까운 자리)
+  _buildTowers(roadNear) {
+    const C = this.course;
+    const K = this.kit.tower ? { ...CITY.tower, ...this.kit.tower } : CITY.tower; // 16차 U7: 스테이지 kit 이 개수 등을 덮어쓸 수 있음(S1 은 그대로)
+    this.towers = [];
+    const land = (x, z, hd) => this.bankDist(x, z) >= 36 && !roadNear(x, z, hd);
+    const marks = this.kit.landmarks || {}; // 16차 U6a: 회전 구간 바깥쪽 랜드마크는 스테이지 kit(S1: 좌 90° 바깥 = 오른쪽 첨탑, 우 120° 바깥 = 왼쪽 전광판 탑)
+    for (const zone of C.def.zones) {
+      const a = Math.max(-60, zone.s[0]), b = Math.min(C.length, zone.s[1]);
+      if (b - a < 40) continue;
+      const n = Math.max(K.n[0], Math.min(K.n[1], Math.round((b - a) / 150)));
+      const lm = marks[zone.id];
+      for (let i = 0; i < n; i++) {
+        const want = lm && i === 0 ? lm : null;
+        let placed = false;
+        for (let tries = 0; tries < 60 && !placed; tries++) {
+          // 랜드마크: 회전 구간 가운데에서 앞뒤로 넓혀 가며(구간 앞뒤 40m 까지) 바깥쪽 땅을 찾는다(바깥쪽이 물인 곳이 많다)
+          const s = want ? (a + b) / 2 + (tries % 2 ? 1 : -1) * Math.ceil(tries / 2) * (((b - a) / 2 + 40) / 30)
+            : tries < 20 ? a + ((i + 0.5) * (b - a)) / n + rand(-0.3, 0.3) * ((b - a) / n) : rand(a, b);
+          const side = want ? want.side : tries % 2 === 0 ? 1 : -1;
+          const w = rand(K.size[0], K.size[1]), d = rand(K.size[0], K.size[1]);
+          const hd = Math.hypot(w, d) / 2;
+          const eMax = want || tries < 40 ? K.edge[1] : 66;
+          for (let e = K.edge[0]; e <= eMax && !placed; e += 2.5) {
+            const p = C.xz(s, side * (e + hd), {});
+            if (!land(p.x, p.z, hd)) continue;
+            const nn = C.nearest(p.x, p.z);
+            const edge = Math.abs(nn.u) - hd;
+            if (edge < K.edge[0] || edge - ELLIPSE.u < K.gap) continue;
+            if (this.towers.some((t) => Math.hypot(t.x - p.x, t.z - p.z) < t.hd + hd + 6)) continue;
+            const yaw = -C.at(nn.s, {}).th;
+            const top = C.center(nn.s) + rand(K.top[0], K.top[1]);
+            this.towers.push({ x: p.x, z: p.z, w, d, yaw, hd, top, s: nn.s, u: nn.u, edge, zone: zone.id, kind: want ? want.kind : 'tower' });
+            placed = true;
+          }
+        }
+      }
+    }
+    for (const t of this.towers) {
+      const ty = Math.max(0, this.terrainY(t.x, t.z));
+      const h = t.top - ty;
+      const tk = this.kit.towerKind ?? 1; // 16차 U7: S2 는 낡은 상가 건물(6)
+      this._addBuildingWorld(t.x, t.z, t.yaw, t.w, t.d, h + ty, tk, rand(0.45, 0.7), rand(0.95, 1.15));
+      this._occMark(t.x, t.z, 3, t.top, Math.min(t.w, t.d) / 2);
+      this.lots.push({ x: t.x, z: t.z, w: t.w, d: t.d, h: t.top, kind: tk, yaw: t.yaw, top: t.top, propTop: t.top, s: t.s, edge: t.edge, band: 'tower', tower: true, gen: 'tower' });
+      const cy = Math.cos(t.yaw), sy = Math.sin(t.yaw);
+      // 옥상 난간 + 항공등(탑 위 안테나는 허용)
+      this._addBuildingWorld(t.x, t.z, t.yaw, t.w + 0.3, t.d + 0.3, 0.9, 3, 0, 1, t.top);
+      if (t.kind === 'spire') {
+        // 첨탑: 지붕 위 가는 기둥 14m + 끝 항공등
+        this._addBuildingWorld(t.x, t.z, t.yaw, 3.2, 3.2, 5, 3, 0, 1, t.top);
+        this._addBuildingWorld(t.x, t.z, 0, 0.5, 0.5, 14, 3, 0, 1, t.top + 5);
+        const g = this._addGlow(t.x, t.top + 19.3, t.z, 0.5, 0.5, 0.5, this.avCol);
+        if (g >= 0) (this.avLights || (this.avLights = [])).push(g);
+        t.propTop = t.top + 19.5;
+      } else {
+        const ah = rand(5, 9);
+        this._addBuildingWorld(t.x, t.z, 0, 0.3, 0.3, ah, 3, 0, 1, t.top);
+        const g = this._addGlow(t.x, t.top + ah + 0.2, t.z, 0.4, 0.4, 0.4, this.avCol);
+        if (g >= 0) (this.avLights || (this.avLights = [])).push(g);
+        t.propTop = t.top + ah + 0.4;
+      }
+      if (t.kind === 'board') {
+        // 전광판 탑: 코스 쪽 면 위쪽에 큰 빛 판(HDR 0.7 이하, 깜빡임 없음)
+        const face = t.u > 0 ? -1 : 1;
+        const lz = face * (t.d / 2 + 0.25);
+        const col = pick([[0.22, 0.5, 0.62], [0.42, 0.26, 0.62]]);
+        this._addGlow(t.x + sy * lz, t.top - 6, t.z + cy * lz, t.w * 0.8, 7, 0.3, col, t.yaw);
+      }
+    }
+  }
+
+  // 15차 점검: 가까운 띠(edge ≤ 80m) 지붕 + 옥상 소품 최고점 > 통로 바닥 − 1m 인 건물(s 5m 마다) · 옆 탑 규칙 위반
+  checkCaps() {
+    const C = this.course;
+    const K = CITY.cap;
+    const viol = [];
+    let nearN = 0;
+    for (let s = Math.max(C.def.capS[0], -60); s <= C.length + 60; s += 5) {
+      const floor = C.center(s) - ELLIPSE.v - K.propGap;
+      for (const L of this.lots) {
+        if (L.tower || L.band !== 'near') continue;
+        if (Math.abs(L.s - s) > L.hd) continue;
+        nearN++;
+        if (L.propTop > floor + 1e-6) viol.push({ s, lot: L.s.toFixed(1), edge: +L.edge.toFixed(1), propTop: +L.propTop.toFixed(2), floor: +floor.toFixed(2) });
+      }
+    }
+    const tViol = [];
+    for (const t of this.towers || []) {
+      if (t.edge - ELLIPSE.u < CITY.tower.gap) tViol.push({ s: t.s, edge: t.edge, why: 'gap' });
+    }
+    const byZone = {};
+    for (const t of this.towers || []) byZone[t.zone] = (byZone[t.zone] || 0) + 1;
+    return { viol: viol.length, sample: viol.slice(0, 8), checked: nearN, towers: (this.towers || []).length, byZone, towerViol: tViol, towerList: (this.towers || []).map((t) => ({ s: +t.s.toFixed(0), u: +t.u.toFixed(1), edge: +t.edge.toFixed(1), top: +t.top.toFixed(1), zone: t.zone, kind: t.kind })) };
+  }
+
+  // 15차: (x, z) 반경 r 안 지붕 최고(props 면 옥상 소품 포함, skipTower 면 옆 탑 빼고). 건물 바닥 칸 표(50m)로 찾는다
+  roofMax(x, z, r, skipTower = false, props = true) {
+    if (!this._lotGrid || this._lotGridN !== this.lots.length) {
+      const G = new Map();
+      for (const L of this.lots) {
+        const k = `${Math.floor(L.x / 50)},${Math.floor(L.z / 50)}`;
+        if (!G.has(k)) G.set(k, []);
+        G.get(k).push(L);
+      }
+      this._lotGrid = G;
+      this._lotGridN = this.lots.length;
+    }
+    let m = 0;
+    const R = Math.ceil((r + 40) / 50);
+    const cx = Math.floor(x / 50), cz = Math.floor(z / 50);
+    for (let i = -R; i <= R; i++) for (let j = -R; j <= R; j++) {
+      const a = this._lotGrid.get(`${cx + i},${cz + j}`);
+      if (!a) continue;
+      for (const L of a) {
+        if (skipTower && L.tower) continue;
+        if (Math.hypot(L.x - x, L.z - z) - Math.hypot(L.w, L.d) / 2 > r) continue;
+        m = Math.max(m, props ? L.propTop ?? L.top ?? L.h : L.top ?? L.h);
+      }
+    }
+    return m;
   }
 
   // ---------- 건물(구역별) ----------
@@ -2409,7 +3258,7 @@ export class World {
     const o = this.occ;
     // 코스 둘레 격자 칸(26m)에 건물 하나씩(흔들어서)
     let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
-    for (let s = -320; s <= S_END(); s += 10) {
+    for (let s = -320; s <= S_END(C); s += 10) {
       const p = C.xz(s, 0, {});
       x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x);
       z0 = Math.min(z0, p.z); z1 = Math.max(z1, p.z);
@@ -2426,6 +3275,8 @@ export class World {
       }
       return false;
     };
+    this._makeBlocks();
+    this._buildTowers(roadNear);
     let dong = 0;
     for (let gx = x0; gx < x1; gx += cell) {
       for (let gz = z0; gz < z1; gz += cell) {
@@ -2435,108 +3286,120 @@ export class World {
         if (n.d > K.fill + 20) continue;
         const bd = this.bankDist(x, z);
         if (bd < 36) continue; // 물·강둑·둔치·강변도로
-        const sC = Math.max(-40, Math.min(COURSE.length + 20, n.s));
+        const sC = Math.max(-40, Math.min(C.length + 20, n.s));
         const zone = C.zoneAt(sC);
         const pth = C.at(sC, {});
         const yaw = n.d < 230 ? -pth.th : Math.round(-pth.th / (Math.PI / 2)) * (Math.PI / 2);
         let w = rand(14, 21);
         let d = rand(12, 19);
-        const halfDiag = Math.hypot(w, d) / 2;
-        if (roadNear(x, z, halfDiag)) continue;
-        // 통로 둘레: 경로에서 clearU 안쪽(건물 모서리 기준)은 통로 바닥 − 3m 아래로만
+        const halfDiag0 = Math.hypot(w, d) / 2;
+        if (roadNear(x, z, halfDiag0)) continue;
+        // 15차: 옆 탑 자리와 겹치면 비움
+        if (this.towers.some((t) => Math.hypot(t.x - x, t.z - z) < t.hd + halfDiag0 * 0.8)) continue;
         const cv = C.center(sC);
-        const edge = Math.abs(n.u) - halfDiag;
-        let hMax = 300;
-        if (n.s > -60 && n.s < COURSE.length + 60 && edge < K.clearU) hMax = cv - COURSE.ellipse.v - 3;
-        if (hMax < 5) continue;
-        let kind = 2;
-        let h;
         let lit = rand(0.25, 0.75); // 11차 배3: 건물마다 점등률 0.25~0.75
         const au = Math.abs(n.u);
-        if ((zone.id === 'canyon' || zone.id === 'avenue' || (zone.id === 'climb' && sC < remapS(380))) && au < 120 && n.d < 125) {
-          // 빌딩 협곡: 유리 업무 빌딩(대로 쪽 벽이 경로에서 21m)
-          kind = 1;
-          h = rand(48, 112) * (au < 60 ? 1 : 0.8);
-          w = rand(18, 26);
-          d = rand(16, 24);
-        } else if ((zone.id === 'climb' || zone.id === 'roof') && au < 170) {
-          // 협곡 출구 → 옥상: 지붕이 통로 아래로 낮아진다(가까울수록 통로 바닥 바로 아래)
-          kind = Math.random() < 0.3 ? 1 : 2;
-          const below = cv - COURSE.ellipse.v - rand(3.5, 9);
-          h = au < 70 ? below : rand(Math.max(10, below - 6), below + 14);
-          w = rand(16, 24);
-          d = rand(14, 22);
-          lit = rand(0.35, 0.6);
-        } else if (bd < 140) {
-          // 강변 아파트(판상형) — 11차 배3: 35% 는 탑상형(두 상자를 十자로)
-          kind = 0;
-          h = Math.round(rand(36, 66) / 2.8) * 2.8 + 1.4;
-          w = rand(40, 56);
-          d = rand(13, 15);
-          if (Math.random() < 0.35) { w = rand(22, 26); d = rand(10, 12); }
-          if (roadNear(x, z, Math.hypot(w, d) / 2)) continue;
-        } else {
-          kind = Math.random() < 0.55 ? 0 : 2;
-          h = kind === 0 ? Math.round(rand(30, 60) / 2.8) * 2.8 + 1.4 : rand(10, 28);
-          if (kind === 0) {
-            w = rand(36, 50);
-            d = rand(13, 15);
-            if (roadNear(x, z, Math.hypot(w, d) / 2)) continue;
-          }
+        // 16차 U6a: 구역 분기를 생성기 표(stage.kit.zones)로 — 앞에서부터 해 보고, 맞는 것이 없으면 base(난수 부르는 순서는 옛 분기와 같다)
+        const g = { x, z, n, au, bd, cv, sC, w, d, halfDiag0, roadNear, lit };
+        let r = null;
+        let genName = 'base';
+        for (const it of kitList(this.kit, zone.id)) {
+          if (it.sBelow !== undefined && !(sC < it.sBelow)) continue;
+          r = CITY_GEN[it.gen](g);
+          if (r) { genName = it.gen; break; }
         }
-        h = Math.min(h, hMax);
-        if (h < 5) continue;
+        if (r === SKIP) continue;
+        const kind = r.kind;
+        let h = r.h;
+        w = r.w;
+        d = r.d;
+        lit = g.lit;
+        // 15차 A-2: 세 띠 상한(가까운 띠 = 블록 계단, 중간 띠 = 거리 따라 올라감, 먼 띠 = 그대로)
+        const halfDiag = Math.hypot(w, d) / 2;
+        if (halfDiag > halfDiag0 + 0.5 && roadNear(x, z, halfDiag)) continue;
+        const edge = Math.abs(n.u) - halfDiag;
         const ty = Math.max(0, this.terrainY(x, z));
+        const capTop = this._capTop(n.s, edge, halfDiag);
+        const band = !Number.isFinite(capTop) ? 'far' : edge <= CITY.cap.near ? 'near' : 'mid';
+        if (band === 'near') {
+          const B = CITY.block;
+          const fr = this._blockHigh(n.s, n.u) ? B.high : B.low;
+          h = (capTop - ty) * rand(fr[0], fr[1]);
+          if (kind === 0) h = Math.floor((h - 1.4) / 2.8) * 2.8 + 1.4; // 아파트는 층 높이(2.8m) 단위로 내림
+        } else if (band === 'mid') {
+          h = Math.min(h, capTop - ty);
+        }
+        if (h < 5) continue;
         const bgain = rand(0.85, 1.15);
         const bi0 = this._addBuildingWorld(x, z, yaw, w, d, h + ty, kind, lit, bgain);
         if (kind === 0 && w < 30) {
           // 탑상형: 같은 높이 상자를 직각으로 하나 더(十자) — 같은 건물 인스턴스(그리기 호출 늘지 않음)
           this._addBuildingWorld(x, z, yaw + Math.PI / 2, w, d, h + ty, kind, lit, bgain, 0, bi0 >= 0 ? this.infoAttr.getX(bi0) : null);
         }
-        this.lots.push({ x, z, w, d, h: h + ty, kind, yaw });
-        this._occMark(x, z, 3, h + ty, Math.min(w, d) / 2);
         const top = h + ty;
+        // 15차: 가까운 띠 옥상 소품은 「통로 바닥 − 1m」 아래만(안테나·십자가 없음, 계단탑·기계실은 맞을 때만, 물탱크 2.4m)
+        const near = band === 'near';
+        const pLim = near ? this._propTop(n.s, halfDiag) : Infinity;
+        const room = pLim - top;
+        let propTop = top;
+        const prop = (hh) => { propTop = Math.max(propTop, top + hh); };
+        const lot = { x, z, w, d, h: top, kind, yaw, top, s: n.s, u: n.u, edge, hd: halfDiag, band, gen: genName }; // 16차 U7: gen = 생성기 이름(품질 관문 집계용, 난수 없음)
+        this.lots.push(lot);
+        this._occMark(x, z, 3, h + ty, Math.min(w, d) / 2);
         const cy = Math.cos(yaw), sy = Math.sin(yaw);
         const at = (lx, lz) => ({ x: x + cy * lx + sy * lz, z: z - sy * lx + cy * lz });
         // 옥상 소품
         if (kind === 0) {
           // 옥탑(기계실) + 물탱크 + 동 번호
-          const q = at(rand(-w * 0.3, w * 0.3), 0);
-          this._addBuildingWorld(q.x, q.z, yaw, rand(6, 9), Math.min(d * 0.6, 8), 3.2, 3, 0, 1, top);
+          if (room >= 3.2) {
+            const q = at(rand(-w * 0.3, w * 0.3), 0);
+            this._addBuildingWorld(q.x, q.z, yaw, rand(6, 9), Math.min(d * 0.6, 8), 3.2, 3, 0, 1, top);
+            prop(3.2);
+          }
           // 12차 배6: 계단실·승강기 탑(판상형은 양쪽 끝 가까이 1~2개, 옥상 위로 4.5~6.5m) + 옥상 난간(낮은 테두리)
           const nT = w > 30 ? 2 : 1;
           for (let t2 = 0; t2 < nT; t2++) {
+            const th2 = rand(4.5, 6.5);
+            if (th2 > room) continue;
             const q2 = at((t2 === 0 ? -1 : 1) * w * rand(0.18, 0.36), rand(-d * 0.15, d * 0.15));
-            this._addBuildingWorld(q2.x, q2.z, yaw, rand(4.5, 6.5), rand(4.5, 6), rand(4.5, 6.5), 3, 0, 1, top);
+            this._addBuildingWorld(q2.x, q2.z, yaw, rand(4.5, 6.5), rand(4.5, 6), th2, 3, 0, 1, top);
+            prop(th2);
           }
           this._addBuildingWorld(x, z, yaw, w + 0.25, d + 0.25, 1.1, 3, 0, 1, top);
+          prop(1.1);
           this.signList.push({ x, z, yaw, w, d, top, kind: 'dong', n: dong++, size: 8 });
-        } else if (top < 45 || zone.id === 'roof' || zone.id === 'climb') {
+        } else if (top < 45 || (this.kit.roofProps || []).includes(zone.id) || near) {
           // 물탱크(원통) · 실외기(작은 상자) · 안테나(항공등)
           const nt = 1 + Math.floor(Math.random() * 2);
-          for (let k = 0; k < nt; k++) {
+          const tankH = near ? CITY.water : 3.15;
+          for (let k = 0; k < nt && tankH <= room; k++) {
             const q = at(rand(-w * 0.3, w * 0.3), rand(-d * 0.3, d * 0.3));
             const r = rand(1.4, 2.2);
-            this._addCylW(q.x, top + 1.4, q.z, r * 2, 2.8, r * 2, 0x56585e);
-            this._addCylW(q.x, top + 3.0, q.z, r * 2.05, 0.3, r * 2.05, 0x3c3e44);
+            const body = tankH - 0.3;
+            this._addCylW(q.x, top + body / 2, q.z, r * 2, body, r * 2, 0x56585e);
+            this._addCylW(q.x, top + body + 0.15, q.z, r * 2.05, 0.3, r * 2.05, 0x3c3e44);
+            prop(tankH);
           }
           const na = 3 + Math.floor(Math.random() * 4);
           for (let k = 0; k < na; k++) {
             const q = at(rand(-w * 0.4, w * 0.4), rand(-d * 0.4, d * 0.4));
             this._addBuildingWorld(q.x, q.z, yaw + rand(-0.1, 0.1), rand(1.2, 1.8), rand(0.8, 1.2), 1.0, 3, 0, 1, top);
+            prop(1.0);
           }
-          if (Math.random() < 0.55) {
+          if (!near && Math.random() < 0.55) {
             const q = at(rand(-w * 0.3, w * 0.3), rand(-d * 0.3, d * 0.3));
             const ah = rand(5, 11);
             this._addBuildingWorld(q.x, q.z, 0, 0.25, 0.25, ah, 3, 0, 1, top);
             const gi2 = this._addGlow(q.x, top + ah + 0.2, q.z, 0.35, 0.35, 0.35, [0.55, 0.02, 0.05]); // 항공등: 어둡고 작은 진홍(위험색 붉은 주황과 다름)
             if (gi2 >= 0) (this.avLights || (this.avLights = [])).push(gi2); // 11차 배4: 0.5Hz 로 부드럽게(밝기 변화 0.2 이하), 판정 시간에는 멈춤
+            prop(ah + 0.4);
           }
           // 옥상 난간(낮은 테두리)
           this._addBuildingWorld(x, z, yaw, w + 0.3, d + 0.3, 0.9, 3, 0, 1, top);
-          if (kind === 2 && Math.random() < 0.5) this.signList.push({ x, z, yaw, w, d, top, kind: 'neon' });
-          // 11차 배4: 교회 십자가 네온(상가 8곳에 1개, 옥상 위 +4~6m, 통로 중심선 25m 밖, HDR 0.6, 깜빡임 없음)
-          if (kind === 2 && n.d > 25 && (this._crossN = (this._crossN || 0) + 1) % 8 === 0) {
+          prop(0.9);
+          if (kind === 2 && Math.random() < 0.5 && room >= 3.8) { this.signList.push({ x, z, yaw, w, d, top, kind: 'neon' }); prop(3.8); }
+          // 11차 배4: 교회 십자가 네온(상가 8곳에 1개, 옥상 위 +4~6m, 통로 중심선 25m 밖, HDR 0.6, 깜빡임 없음) — 15차: 가까운 띠 밖만
+          if (kind === 2 && !near && n.d > 25 && (this._crossN = (this._crossN || 0) + 1) % 8 === 0) {
             const cy2 = top + rand(4, 6);
             const red = [0.6, 0.05, 0.06];
             this._addGlow(x, cy2, z, 0.25, 3, 0.25, red, yaw);
@@ -2550,7 +3413,9 @@ export class World {
           this.signList.push({ x, z, yaw, w, d, top, kind: 'band' });
           if (top > 12 && Math.random() < 0.6) this.signList.push({ x, z, yaw, w, d, top, kind: 'vert', side: Math.random() < 0.5 ? -1 : 1 });
         }
-        if (zone.id !== 'canyon' || Math.random() < 0.3) this.launchers.push({ x, y: top + 0.5, z, kind: 'roof' });
+        lot.propTop = propTop;
+        const keep = (this.kit.launcherKeep || {})[zone.id]; // 16차 U6a: 옥상 발사대 비율(S1 협곡 0.3)
+        if (keep === undefined || Math.random() < keep) this.launchers.push({ x, y: top + 0.5, z, kind: 'roof' });
       }
     }
     // 둔치 군중(지류 시작 구간 양쪽, 본류 끝 구간 도심 쪽)
@@ -2564,8 +3429,8 @@ export class World {
         this.crowdSpots.push(x, z, Math.random());
       }
     }
-    const sCr = remapS(640);
-    for (let s = 0; s < COURSE.length + 40 - sCr; s += 0.6) {
+    const sCr = remapS(640, C.def);
+    for (let s = 0; s < C.length + 40 - sCr; s += 0.6) {
       if (Math.random() > 0.8) continue;
       const p = C.xz(sCr + s, 0, {});
       const uv = this._mainUV(p.x, p.z);
@@ -2592,14 +3457,14 @@ export class World {
       if (n.d < CITY.fill + 15) continue;
       const yaw = Math.random() < 0.5 ? -C.at(Math.max(C.sMin, Math.min(C.sMax, n.s)), {}).th : rand(0, Math.PI);
       const cnt = Math.floor(rand(3, 7));
-      const hBase = rand(40, 90);
+      const hBase = rand(40, 90) * (this.kit.farH || 1); // 16차 U9: S4 원경은 더 높게(kit.farH) — 같은 난수 흐름
       for (let k = 0; k < cnt; k++) {
         const ox = (k - cnt / 2) * rand(30, 40);
         const px = x - Math.sin(yaw) * ox;
         const pz = z + Math.cos(yaw) * ox;
         if (this.bankDist(px, pz) < 40) continue;
         const h = Math.round((hBase * rand(0.8, 1.2)) / 2.8) * 2.8 + 1.4;
-        this._addBuildingWorld(px, pz, yaw, rand(45, 70), rand(13, 16), h, Math.random() < 0.85 ? 0 : 1, rand(0.25, 0.75), rand(0.9, 1.2));
+        this._addBuildingWorld(px, pz, yaw, rand(45, 70), rand(13, 16), h, Math.random() < 1 - (this.kit.farGlass ?? 0.15) ? 0 : 1, rand(0.25, 0.75), rand(0.9, 1.2)); // 16차 U9: S4 는 유리 비율 kit.farGlass(S1~S3 0.15 그대로)
         this._occMark(px, pz, 3, h, 8);
         if (Math.random() < 0.5) this.launchers.push({ x: px, y: h + 1, z: pz, kind: 'roof' });
         if (k === 0) this._addHalo(px, h * 0.55, pz, h * 0.9, [0.06, 0.045, 0.03]);
@@ -2688,6 +3553,36 @@ export class World {
         a = a1;
       }
     });
+    // 16차 U7(S2): 코스를 따라 「앞을 보는 방향」 800·1,100m 에 원경 카드 묶음(코스에서 450m 넘게 먼 조각만) — 지도 가운데 고리만으로는
+    //   S2 처럼 꺾인 코스에서 앞쪽 지평선에 카드가 없는 장이 생긴다(품질 관문 「원경 카드가 모든 장에」)
+    if (this.kit && this.kit.style) { // 16차 U8: 새 스테이지 모두
+      const C = this.course;
+      const seen = [];
+      const p = {};
+      for (let s = C.sMin; s <= C.length + 60; s += 30) {
+        C.at(s, p);
+        const Fx = Math.sin(p.th), Fz = -Math.cos(p.th), Rx = Math.cos(p.th), Rz = Math.sin(p.th);
+        for (const [D, layer] of [[800, 0], [1100, 1]]) {
+          const qx = p.x + Fx * D, qz = p.z + Fz * D;
+          if (seen.some((o) => Math.hypot(o[0] - qx, o[1] - qz) < 150)) continue;
+          seen.push([qx, qz]);
+          let off = -rand(140, 200);
+          while (off < rand(140, 200)) {
+            const wSeg = rand(22, 55);
+            const h = rand(40, 90) * (Math.random() < 0.15 ? 0.55 : 1);
+            const dd = rand(-25, 25);
+            const p0 = [qx + Rx * off + Fx * dd, qz + Rz * off + Fz * dd], p1 = [qx + Rx * (off + wSeg) + Fx * dd, qz + Rz * (off + wSeg) + Fz * dd];
+            off += wSeg;
+            if (C.nearest((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2).d < 450) continue;
+            const b = pos.length / 3;
+            pos.push(p0[0], -5, p0[1], p1[0], -5, p1[1], p0[0], h, p0[1], p1[0], h, p1[1]);
+            const xa = off * 3 + s, xb = xa + wSeg;
+            af.push(layer, xa, 0, layer, xb, 0, layer, xa, 1, layer, xb, 1);
+            idx.push(b, b + 1, b + 2, b + 2, b + 1, b + 3);
+          }
+        }
+      }
+    }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     geo.setAttribute('aF', new THREE.Float32BufferAttribute(af, 3));
@@ -2715,10 +3610,11 @@ export class World {
 
   // 가로등: 강변도로·대로·골목(땅 위 부분)
   _buildLamps() {
-    const lamp = new THREE.Color(this.stage.lampColor);
+    const lamp = new THREE.Color(this.stage.city.lampColor);
     const lc = [lamp.r * 1.8, lamp.g * 1.8, lamp.b * 1.8];
     for (const L of this.lines) {
-      const pts = this._densify(L.pts, 30);
+      if (L.noLamp) continue; // 16차 U7: S2 골목은 전봇대 보안등(alley.js)
+      const pts = this._densify(L.pts, L.lampStep || 30);
       for (let i = 0; i < pts.length - 1; i++) {
         const p = pts[i];
         if (this._raised(p)) continue;
@@ -2728,8 +3624,8 @@ export class World {
         dx /= l; dz /= l;
         // 코스에서 1.2km 넘게 먼 가로등은 생략(안 보임)
         const n = this.course.nearest(p[0], p[2]);
-        if (n.d > 900) continue;
-        for (const side of [-1, 1]) {
+        if (n.d > (L.lampFar || 900)) continue;
+        for (const side of L.lampSides || [-1, 1]) {
           const off = L.half + 1.2;
           const x = p[0] - dz * side * off;
           const z = p[2] + dx * side * off;
@@ -2738,7 +3634,7 @@ export class World {
           (this.lampXZ || (this.lampXZ = [])).push([x, z]);
           this._addBuildingWorld(x, z, 0, 0.22, 0.22, 7, 3, 0, 1, p[1]);
           this._addHalo(x, y, z, 2.6, [lamp.r * 0.55, lamp.g * 0.45, lamp.b * 0.32]);
-          if (n.d < 420) this._addCone(x, y - 0.1, z, 6.7, 3.2, [lamp.r * 0.07, lamp.g * 0.055, lamp.b * 0.035]);
+          if (n.d < 420 && !L.noCone) this._addCone(x, y - 0.1, z, 6.7, 3.2, [lamp.r * 0.07, lamp.g * 0.055, lamp.b * 0.035]); // 16차 U8: noCone 선은 빛기둥 없음(원뿔 버퍼)
           // 11차 배1: 그 가로등 아래 바닥 빛웅덩이(반지름 5.5m) + 차도 쪽 젖은 노면 반사 띠(길이 6~10m · 폭 0.6m · 밝기 0.35 이하)
           if (n.d < 600) {
             const xg = p[0] - dz * side * (L.half - 1.5), zg = p[2] + dx * side * (L.half - 1.5);
@@ -2772,22 +3668,27 @@ export class World {
     const C = this.course;
     const segs = [];
     for (const L of this.lines) {
-      const per = L.name.includes('강변도로') ? 150 : L.kind === 'avenue' ? 120 : L.kind === 'bridge' ? 60 : 0; // 12차 배7: 줄당 150대(강변) · 대로 120 · 다리 60
+      const per = L.cars ?? (L.name.includes('강변도로') ? 150 : L.kind === 'avenue' ? 120 : L.kind === 'bridge' ? 60 : 0); // 12차 배7: 줄당 150대(강변) · 대로 120 · 다리 60 — 16차 U7: 선마다 L.cars 로 덮어씀(S2 외곽 도로)
       if (!per) continue;
-      const pts = this._densify(L.pts, 40);
+      const pts = this._densify(L.pts, L.carStep || 40); // 16차 U8: 굽은 램프는 촘촘히(차가 상판 밖으로 지름길을 내지 않게)
       // 선분 묶기(최대 160m)
       const pieces = [];
       let a = 0;
       for (let i = 1; i < pts.length; i++) {
         const len = Math.hypot(pts[i][0] - pts[a][0], pts[i][2] - pts[a][2]);
-        if (len >= 150 || i === pts.length - 1) { pieces.push([pts[a], pts[i]]); a = i; }
+        // 16차 U8: 열차 선로는 곧은 동안만 한 선분(1° 넘게 꺾이면 끊음 — 굽은 곳은 열차 없음)
+        if (L.train && i > a + 1) {
+          const d0x = pts[a + 1][0] - pts[a][0], d0z = pts[a + 1][2] - pts[a][2], d1x = pts[i][0] - pts[i - 1][0], d1z = pts[i][2] - pts[i - 1][2];
+          if ((d0x * d1x + d0z * d1z) / ((Math.hypot(d0x, d0z) * Math.hypot(d1x, d1z)) || 1) < Math.cos(Math.PI / 180)) { pieces.push([pts[a], pts[i - 1]]); a = i - 1; continue; }
+        }
+        if (len >= (L.carPiece || 150) || i === pts.length - 1) { pieces.push([pts[a], pts[i]]); a = i; }
       }
       const ok = pieces.filter(([p, q]) => {
         for (const f of [0, 0.25, 0.5, 0.75, 1]) {
           const x = p[0] + (q[0] - p[0]) * f, y = p[1] + (q[1] - p[1]) * f, z = p[2] + (q[2] - p[2]) * f;
           const n = C.nearest(x, z);
           if (n.d > 1100) return false;
-          if (n.d < 40 && y + 1 > C.center(Math.max(C.sMin, Math.min(C.sMax, n.s))) - COURSE.ellipse.v - 3) return false;
+          if (n.d < 40 && y + 1 > C.center(Math.max(C.sMin, Math.min(C.sMax, n.s))) - ELLIPSE.v - 3) return false;
         }
         return true;
       });
@@ -2799,9 +3700,26 @@ export class World {
         segs.push({ L, p, q, len, n });
       }
     }
+    this.carReq = segs.reduce((t, sg) => t + sg.n, 0); // 16차 U7b: 요청 수(버퍼 포화 점검)
     let k = 0;
     for (const sg of segs) {
       const dx = (sg.q[0] - sg.p[0]) / sg.len, dz = (sg.q[2] - sg.p[2]) / sg.len;
+      if (sg.L.train) {
+        // 16차 U8: 열차(고가 선로) — 객실(버스 상자 11m)이 12.4m 간격으로 같은 속도, 앞 칸만 불빛. 선분마다 두 선로(±2.3m) 번갈아
+        const T = sg.L.train;
+        if (sg.len < 150) continue;
+        const dir = (this._trainDir = -(this._trainDir || 1));
+        const A = dir > 0 ? sg.p : sg.q, B = dir > 0 ? sg.q : sg.p;
+        const off = dir * 2.3, ox = -dz * off, oz = dx * off;
+        const ph0 = Math.random(), sp = rand(16, 22);
+        for (let j = 0; j < T.units && k < MAX.car; j++) {
+          this.carA.setXYZW(k, A[0] + ox, A[1] + 0.25, A[2] + oz, (ph0 + 1 - (j * 12.4) / sg.len) % 1);
+          this.carB.setXYZW(k, B[0] + ox, B[1] + 0.25, B[2] + oz, sp / sg.len);
+          this.carC.setXYZW(k, 11, 0.35, j === 0 ? 0.95 : 0, 1);
+          k++;
+        }
+        continue;
+      }
       let left = sg.n;
       while (left > 0 && k < MAX.car) {
         const g = Math.min(left, 3 + Math.floor(Math.random() * 4)); // 3~6대 무리
@@ -2852,12 +3770,14 @@ export class World {
           if (n.d > 700) continue;
           if (this.isWater(x, z)) continue;
           let sc = rand(0.85, 1.2);
-          if (n.s > -60 && n.s < COURSE.length + 60 && Math.abs(n.u) < CITY.clearU + 2) {
-            const maxH = C.center(Math.max(C.sMin, Math.min(C.sMax, n.s))) - COURSE.ellipse.v - 3 - p[1];
+          const capT = this._capTop(n.s, Math.abs(n.u) - 3, 3); // 15차: 건물과 같은 세 띠 상한
+          if (Number.isFinite(capT)) {
+            const maxH = capT - p[1];
             if (maxH < 3.5) continue;
             sc = Math.min(sc, maxH / 6.2);
           }
           if (Math.abs((i * 9) % 30 - 0) < 3) continue; // 가로등 자리
+          if (this.kit.style && this._underDeck(x, z, p[1])) continue; // 16차 U8: 고가 상판 아래에는 나무를 두지 않는다(수관이 상판을 뚫음)
           this._treeAt(k++, x, p[1] + 0.15, z, sc);
           if (k >= MAX.tree) break;
         }
@@ -2872,18 +3792,35 @@ export class World {
         if (this._raised(p) || i % 5 === 0) continue;
         const n = C.nearest(p[0], p[2]);
         let sc = rand(0.8, 1.05);
-        if (n.s > -60 && n.s < COURSE.length + 60 && Math.abs(n.u) < CITY.clearU + 2) {
-          const maxH = C.center(Math.max(C.sMin, Math.min(C.sMax, n.s))) - COURSE.ellipse.v - 3 - p[1];
+        const capT = this._capTop(n.s, Math.abs(n.u) - 3, 3); // 15차: 건물과 같은 세 띠 상한
+        if (Number.isFinite(capT)) {
+          const maxH = capT - p[1];
           if (maxH < 4) continue;
           sc = Math.min(sc, maxH / 9);
         }
+        if (this.kit.style && this._underDeck(p[0], p[2], p[1])) continue;
         this._treeAt(k++, p[0], p[1] + 0.15, p[2], sc);
       }
     }
+    // 16차 U8: 생성기가 따로 정한 나무 자리(S3 클로버 고리 안 둔덕 등) — S1 은 없음
+    for (const e of this.extraTrees || []) { if (k >= MAX.tree) break; if (this._underDeck(e[0], e[2], e[1])) continue; this._treeAt(k++, e[0], e[1], e[2], e[3]); }
     this.trees.count = k;
+    this.treeReq = k >= MAX.tree ? k + 1 : k; // 16차 U7b: 꽉 차면 더 놓을 자리가 있었을 수 있다(포화로 본다)
     this.trees.instanceMatrix.needsUpdate = true;
     if (this.trees.instanceColor) this.trees.instanceColor.needsUpdate = true;
     this.treeCount = k;
+  }
+
+  // 16차 U8: (x, z) 가 땅 높이 y 보다 3m 넘게 위에 상판·다리가 있는 칸인가(점유 격자 5, 반칸 둘레까지)
+  _underDeck(x, z, y = 0) {
+    const o = this.occ;
+    for (const [dx, dz] of [[0, 0], [5, 0], [-5, 0], [0, 5], [0, -5]]) {
+      const ix = Math.floor((x + dx - o.x0) / o.cell), iz = Math.floor((z + dz - o.z0) / o.cell);
+      if (ix < 0 || iz < 0 || ix >= o.n || iz >= o.n) continue;
+      const k = iz * o.n + ix;
+      if (o.t[k] === 5 && o.h[k] > y + 3) return true;
+    }
+    return false;
   }
 
   // 12차 가로수 하나: 크기 sc, 가로등(12m 안)에 가까우면 따뜻한 빛(인스턴스 색)
@@ -2914,8 +3851,23 @@ export class World {
     const aUV = this.signs.geometry.attributes.aUV;
     const aCol = this.signs.geometry.attributes.aCol;
     let n = 0;
+    const byType = {};
     for (const sg of this.signList) {
-      if (n >= MAX.sign) break;
+      if (n >= (this.kit && this.kit.style ? MAX.sign : S1_CAP.sign)) break; // 16차 U7: S1 은 15차 상한 900 그대로
+      if (sg.kind === 'q') {
+        // 16차 U7(S2): 자리·크기를 alley.js 가 정한 간판 판(type: neon 네온 글자 · panel 상자 간판 · vert 돌출 세로 네온 · vbox 돌출 세로 상자)
+        const list = byType[sg.type] || (byType[sg.type] = this.atlas.entries.filter((e) => e.kind === sg.type));
+        if (!list.length) continue;
+        const e = list[sg.pick % list.length];
+        let h = sg.h, w = h * e.aspect;
+        if (w > sg.wMax) { w = sg.wMax; h = w / e.aspect; }
+        // 돌출 간판(ax, az = 벽에서 길 쪽 방향)은 안쪽 끝이 벽에 붙게 폭의 절반만큼 밀어 낸다
+        this.signs.setMatrixAt(n, this._worldMatrix(sg.x + (sg.ax || 0) * w * 0.5, sg.y, sg.z + (sg.az || 0) * w * 0.5, sg.yaw, w, h, 1));
+        aUV.setXYZW(n, e.uv[0], e.uv[1], e.uv[2], e.uv[3]);
+        aCol.setXYZW(n, sg.col[0], sg.col[1], sg.col[2], 0);
+        n++;
+        continue;
+      }
       if (sg.kind === 'band' || sg.kind === 'vert') {
         // 11차 배4: 1층 가로 간판 띠(건물 앞면 폭 80%, 높이 0.9m, 3.6m 높이) · 세로 돌출 간판(모서리에서 직각으로 0.6m 튀어나옴, 2~5층)
         const cy = Math.cos(sg.yaw), sy = Math.sin(sg.yaw);
@@ -2971,9 +3923,13 @@ export class World {
       n++;
     }
     this.signs.count = n;
+    this.signN = n;
     this.signs.instanceMatrix.needsUpdate = true;
     aUV.needsUpdate = true;
     aCol.needsUpdate = true;
+    // 16차 U7b(1-4): 새 스테이지는 간판도 「가까운 것만 그리기」(650m — 안개 0.0024 에서 남는 밝기 15% 아래). S1 은 15차 그대로(전부)
+    this.nearS = null;
+    if (this.kit && this.kit.style) { this.nearS = new NearWindow(this.signs, [aUV, aCol], 650); this.nearS.snapshot(n); this.nearS.view = this.nearView || null; }
   }
 
   launcherNear(x, z, maxD) {
@@ -3004,7 +3960,7 @@ export class World {
           if (joined) break;
         }
         let dMin = Infinity;
-        for (let s = -320; s <= S_END(); s += 5) {
+        for (let s = -320; s <= S_END(this.course); s += 5) {
           const p = C.xz(s, 0, this._ce || (this._ce = {}));
           dMin = Math.min(dMin, Math.hypot(p.x - end[0], p.z - end[2]));
         }
@@ -3068,7 +4024,20 @@ export class World {
   update(birdS, camera, time = 0, dt = 0) {
     this.shared.uTime.value = time;
     if (camera) this.sky.position.copy(camera.position);
-    if (camera && this.nearB) { this.nearB.update(camera.position.x, camera.position.z); if (this.nearT) this.nearT.update(camera.position.x, camera.position.z); if (this.nearC) this.nearC.update(camera.position.x, camera.position.z); }
+    if (camera && this.nearB) {
+      const P = camera.position;
+      let fx = 0, fz = -1;
+      if (this.nearView) { camera.getWorldDirection(_nearDir); const L = Math.hypot(_nearDir.x, _nearDir.z) || 1; fx = _nearDir.x / L; fz = _nearDir.z / L; }
+      if (this.nearI) for (const w of this.nearI) w.update(P.x, P.z, fx, fz);
+      this.nearB.update(P.x, P.z, false, fx, fz); if (this.nearT) this.nearT.update(P.x, P.z, false, fx, fz); if (this.nearC) this.nearC.update(P.x, P.z, false, fx, fz);
+      if (this.nearX) for (const w of this.nearX) w.update(P.x, P.z, false, fx, fz); // 16차 U7: S2 전선·천막
+      if (this.nearS) this.nearS.update(P.x, P.z, false, fx, fz); // 16차 U7b: 새 스테이지 간판
+      if (this.nearSt) this.nearSt.update(P.x, P.z, false, fx, fz); // 16차 U8: S3 구조물
+      if (this.wires && this.wires.visible) {
+        const Hpx = (typeof window !== 'undefined' && window.innerHeight) || 720;
+        this.wireMat.uniforms.uPx.value = (2 * Math.tan((camera.fov * Math.PI) / 360)) / Hpx;
+      }
+    }
     if (!this.course) return;
     if (this.search && this.search.length) {
       let k = this.coneStatic || 0;
@@ -3084,7 +4053,8 @@ export class World {
     // 11차 배4: 항공등 0.5Hz 부드러운 점멸(밝기 0.8~1.0 배, 변화 0.2 이하). 판정 시간(calm)에는 멈춤
     if (this.avLights && this.avLights.length) {
       const f = this.calm ? 1 : 0.9 + 0.1 * Math.sin(time * Math.PI);
-      for (const i of this.avLights) { _c.setRGB(0.55 * f, 0.02 * f, 0.05 * f); this.glow.setColorAt(i, _c); }
+      const ac = this.avCol || [0.55, 0.02, 0.05];
+      for (const i of this.avLights) { _c.setRGB(ac[0] * f, ac[1] * f, ac[2] * f); this.glow.setColorAt(i, _c); }
     }
     this.glow.count = gi;
     this.halos.geometry.instanceCount = hi;

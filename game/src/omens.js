@@ -2,10 +2,10 @@
 // - 그리기 호출 1번(인스턴스 사각형 하나, 조각 셰이더가 모양을 그린다 — 화면에 사각형은 보이지 않는다).
 // - bloom 뒤에 깊이 검사 없이 맨 위에 그린다(game → renderer 의 overlay 장면). 폭발 불빛에 묻히지 않게 알 뒤에 어두운 받침을 깐다.
 // - 범위 원 = 판정: 띠 종류는 바깥 원(r_out)과 구멍 원(r_in), 원판 종류는 바깥 원 + 안쪽 옅은 채움. 점선 48칸, 불꽃 색 채도 −30%, HDR 0.6.
-//   중심 = 지나는 순간 띠 중심(폭발 중심 − 처짐). 0.15초 동안 나타나고, 판정 시간에는 불투명도 0.5, 판정이 끝나면 0.2초 동안 사라진다.
+//   중심 = 지나는 순간 띠 중심(폭발 중심 − 처짐). 0.15초 동안 나타나고, 판정 시간에는 불투명도 0.5, 판정이 끝나면 바로 사라진다(16차 U11 — 지난 껍질 원은 카메라 15m 안이면 지움, 화면에서 커진 원판 채움은 빗금).
 // - 조준점: 다음 웨이브에 띠 종류 껍질이 있으면 그 폭발 면 위 「지금 새 자리(u, w)」에 반지름 b 의 점선 고리(흰색 HDR 0.5) — 카메라 시차 없이 구멍을 겨눈다.
 import * as THREE from 'three';
-import { OMEN, BEAT, TIMING, BURST } from './config.js';
+import { OMEN, BEAT, TIMING, BURST, BAND } from './config.js';
 
 const T_EGG = 0, T_FUSE = 1, T_FAINT = 4, T_DASH = 5, T_LINE = 6, T_FILL = 7; // eslint-disable-line no-unused-vars
 
@@ -68,6 +68,8 @@ varying vec2 vUv;
 varying vec4 vC;
 varying vec4 vK;
 varying float vPx;
+uniform vec2 uFillPx; // 16차 U11: 원판 채움을 빗금으로 바꾸는 화면 반지름(화소, 시작·끝)
+uniform vec2 uHatch; // 빗금 간격(화소)·칠한 비율
 // 결과는 미리 곱한 알파: rgb = 더할 빛, a = 뒤를 어둡게 하는 정도
 void main() {
   float t = vK.x;
@@ -140,7 +142,12 @@ void main() {
     a = d * 0.25 * min(1.0, vC.a);
   } else if (t > 6.5) {
     // 원판 안쪽 옅은 채움(「다 위험」) — 둥근 가장자리
+    // 16차 U11: 화면에서 아주 커진 원판(지나기 직전, 카메라 가까이)은 빗금으로 채운다 — 꽉 채우면 다음 예고를 덮는다.
+    //   「다 위험」 뜻은 그대로(안쪽 전체에 빗금, 띠 껍질의 빈 구멍과 헷갈리지 않게 가운데를 비우지 않음)
     float d = 1.0 - smoothstep(1.0 - aa, 1.0, r);
+    float big = smoothstep(uFillPx.x, uFillPx.y, vPx);
+    float hatch = step(fract((gl_FragCoord.x + gl_FragCoord.y) / uHatch.x), uHatch.y);
+    d *= mix(1.0, hatch, big);
     if (d <= 0.0) discard;
     col = vC.rgb * d * vC.a;
     a = d * vC.a;
@@ -178,7 +185,7 @@ export class Omens {
     this.material = new THREE.ShaderMaterial({
       vertexShader: VERT,
       fragmentShader: FRAG,
-      uniforms: { uScale: { value: 900 }, uMinPx: { value: OMEN.minPx }, uLinePx: { value: OMEN.range.px * 0.5 }, uViewport: { value: new THREE.Vector2(1920, 1080) } },
+      uniforms: { uScale: { value: 900 }, uMinPx: { value: OMEN.minPx }, uLinePx: { value: OMEN.range.px * 0.5 }, uViewport: { value: new THREE.Vector2(1920, 1080) }, uFillPx: { value: new THREE.Vector2(OMEN.range.fillPx[0], OMEN.range.fillPx[1]) }, uHatch: { value: new THREE.Vector2(OMEN.range.hatch[0], OMEN.range.hatch[1]) } },
       transparent: true,
       depthTest: false,
       depthWrite: false,
@@ -200,11 +207,14 @@ export class Omens {
     this._w = new THREE.Vector3();
   }
 
-  setScale(scale, vh, vw = vh * 16 / 9) {
+  // lineMin = 범위 원 선 최소 반폭(장치 화소). 16차 3-4: 모바일은 화면 1.5 CSS px 이상(게임이 넘김), 그 밖은 0.75
+  setScale(scale, vh, vw = vh * 16 / 9, lineMin = 0.75) {
     this.material.uniforms.uScale.value = scale;
     this.material.uniforms.uViewport.value.set(vw, vh);
     this.material.uniforms.uMinPx.value = OMEN.minPx * (vh / 1080);
-    this.material.uniforms.uLinePx.value = Math.max(0.75, OMEN.range.px * 0.5 * (vh / 1080));
+    this.material.uniforms.uFillPx.value.set(OMEN.range.fillPx[0] * (vh / 1080), OMEN.range.fillPx[1] * (vh / 1080));
+    this.material.uniforms.uHatch.value.set(Math.max(4, OMEN.range.hatch[0] * (vh / 1080)), OMEN.range.hatch[1]);
+    this.material.uniforms.uLinePx.value = Math.max(lineMin, OMEN.range.px * 0.5 * (vh / 1080));
   }
 
   _push(x, y, z, half, r, g, b, a, type, p1 = 0, p2 = 0, p3 = 0) {
@@ -277,17 +287,29 @@ export class Omens {
     return out;
   }
 
-  // 껍질의 범위 원 불투명도(0~1): 정보(발사 + 0.1) 0.15초 페이드 인 → 폭발 뒤 판정 시간 0.5 → 판정 끝 0.2초 페이드 아웃
+  // 껍질의 범위 원 불투명도(0~1): 정보(발사 + 0.1) 0.15초 페이드 인 → 폭발 뒤 판정 시간 0.5 → 판정이 끝나면 바로 0
+  // 16차 U11(gate16s5 제안 1): 판정이 끝난 원은 더 알려 줄 것이 없는데, 카메라 가까이 남아 다음 예고를 덮었다(피날레 최대 98%) — 페이드 아웃 없이 지운다
   static rangeAlpha(sh, now) {
     const R = OMEN.range;
     if (sh.tInfo === undefined || now < sh.tInfo) return 0;
     let a = Math.min(1, (now - sh.tInfo) / R.fadeIn);
     if (sh.burst) {
       const jEnd = sh.tJudgeEnd !== undefined ? sh.tJudgeEnd : (sh.crossT !== undefined ? sh.crossT : sh.tMeet) + BURST.judgeAfter;
-      if (now <= jEnd) a *= R.judgeA + (1 - R.judgeA) * Math.max(0, 1 - (now - sh.tBurst) / 0.1);
-      else a *= R.judgeA * Math.max(0, 1 - (now - jEnd) / R.fadeOut);
+      if (now > jEnd) return 0;
+      a *= R.judgeA + (1 - R.judgeA) * Math.max(0, 1 - (now - sh.tBurst) / 0.1);
     }
     return a;
+  }
+
+  // 16차 U11: 새가 이미 지난 껍질의 원이 카메라 OMEN.range.passNear(15m) 안이면 지운다 — 새 뒤·카메라 앞에서 화면을 덮는 원
+  //   「지남」 = 새의 경로 거리가 껍질 면 + 판정 띠 깊이(전진 × 0.07초)를 넘음(웨이브가 먼저 끝나 crossed 가 안 찍힌 껍질도 포함). 새가 없으면 crossed
+  static passedNear(sh, cp, bird = null) {
+    if (!cp || !sh.Cw) return false;
+    const passed = bird ? bird.s - sh.s > (bird.forward || 0) * BAND.window : !!sh.crossed; // 면 뒤 판정 띠(전진 × 0.07초)까지 지난 뒤
+    if (!passed) return false;
+    const n = OMEN.range.passNear;
+    const dx = sh.Cw.x - cp.x, dy = sh.Cw.y - cp.y, dz = sh.Cw.z - cp.z;
+    return dx * dx + dy * dy + dz * dz < n * n;
   }
 
   // events: 웨이브(사건) 목록, now: 게임 시각, cam: 카메라, bird: 새(조준점용, 없으면 생략)
@@ -342,7 +364,7 @@ export class Omens {
           if (!ev.shells) continue;
           for (const sh of ev.shells) {
             const a = Omens.rangeAlpha(sh, now);
-            if (a <= 0.004) continue;
+            if (a <= 0.004 || Omens.passedNear(sh, cp, bird)) continue;
             ranges++;
             Omens.rangeCol(sh, col);
             const age = now - sh.tBurst;

@@ -6,7 +6,7 @@
 // - B-2 안전 지대 지도: 이동 타원 × 0.95 − 위험 영역(새 판정 반지름 b 만큼 넓힘)을 0.3m 격자로. 연결된 덩어리마다 내접 반경 ins · 앞 목표에서 거리 M.
 // - B-3 난이도 D(0~100, 새마다) = 100 × min_j [0.50·M_j/reachH + 0.30·clamp((1.3 − ins_j)/0.8) + 0.20·clamp((1.7 − T_h)/0.6)] + (덩어리 1개면 +10)
 //   배치는 규칙 R1~R6 을 통과한 후보 가운데 목표 D(구간별 곡선)에 가장 가까운 것을 고른다.
-import { BIRDS, BURST, BAND, CHOREO, COURSE, BEAT, FEEL, TIMING } from './config.js';
+import { BIRDS, BURST, BAND, CHOREO, ELLIPSE, STAGES, BEAT, FEEL, TIMING, CAMERA } from './config.js';
 
 export function rng(seed) {
   let a = seed >>> 0;
@@ -18,7 +18,7 @@ export function rng(seed) {
   };
 }
 
-const E = COURSE.ellipse;
+const E = ELLIPSE; // 16차 U6a: 이동 타원은 모든 스테이지 공통
 const CELL = CHOREO.cell;
 const NU = 2 * Math.ceil(E.u / CELL) + 1;
 const NW = 2 * Math.ceil(E.v / CELL) + 1;
@@ -344,7 +344,7 @@ export function simHit(spec, w, n = 12, rnd = Math.random, opts = {}) {
       let ax = 0, ay = 0;
       if (aim) {
         let tw = aim[1];
-        if (opts.parallax !== false && !(hasBand && pathOf(w.eggs, aim[0], aim[1]) === 'center')) tw += (1.2 * Math.max(0, (arrive - t) * f + f * ctrl)) / 6;
+        if (opts.parallax !== false && !(hasBand && pathOf(w.eggs, aim[0], aim[1]) === 'center')) tw += ((CAMERA.upOffset / CAMERA.distance) * Math.max(0, (arrive - t) * f + f * ctrl)); // 15차: 카메라 시차 = upOffset / distance
         const du = aim[0] - u, dw = tw - ww;
         ax = Math.abs(du) > Math.abs(vx) / a + 0.08 ? Math.sign(du) : 0;
         ay = Math.abs(dw) > Math.abs(vy) / a + 0.08 ? Math.sign(dw) : 0;
@@ -371,9 +371,10 @@ export function simHit(spec, w, n = 12, rnd = Math.random, opts = {}) {
   return hits / n;
 }
 
-const zoneAt = (s) => {
-  for (const z of COURSE.zones) if (s >= z.s[0] && s < z.s[1]) return z;
-  return COURSE.zones[COURSE.zones.length - 1];
+// 16차 U6a: 구간은 그 스테이지 코스 정의(opts.course = course.def)에서. 없으면 S1
+const zoneOf = (zones, s) => {
+  for (const z of zones) if (s >= z.s[0] && s < z.s[1]) return z;
+  return zones[zones.length - 1];
 };
 // 구간별 D 목표 곡선(진행 0~1). 12차 D 검증 뒤 D = 사람 근사 봇 피격률(%) — config CHOREO.dTarget
 export const D_TARGET = CHOREO.dTarget;
@@ -381,7 +382,8 @@ export const D_TARGET = CHOREO.dTarget;
 const SCENES = { early: ['국화 대 센터 연속 3발', 3, 'chrysL', 'center'], mid: ['고리 연타', 3, 'ring', null], late: ['심 모란 벽 사이 밖 길', 1, 'dahlia', 'out'], finale: ['버드나무 커튼 센터', 1, 'willowL', 'center'] };
 
 // ======================= 한 판 짜기 =======================
-// opts: { seed, sStart, los(wave) → bool, startW, wts(D 가중치), Dfix(웨이브마다 목표 D 덮어쓰기 — 검증용), noD }
+// opts: { seed, sStart, los(wave) → bool, startW, wts(D 가중치), Dfix(웨이브마다 목표 D 덮어쓰기 — 검증용), noD,
+//         course(코스 정의 — 구간·길이), choreo({gap, double, dTarget}), mix(종류 비율) — 16차 U6a: 없으면 S1 }
 export function planStage(birdId, opts = {}) {
   const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
   const spec = BIRDS[birdId];
@@ -390,6 +392,11 @@ export function planStage(birdId, opts = {}) {
   const R = rng(seed);
   const rand = (a, b) => a + R() * (b - a);
   const sStart = opts.sStart ?? 0;
+  const S1 = STAGES[0];
+  const CD = opts.course || S1.course;
+  const CH = opts.choreo || S1.choreo;
+  const MIX = opts.mix || S1.mix;
+  const zoneAt = (s) => zoneOf(CD.zones, s);
   const b = birdR(spec);
   const eighth = BEAT.eighth;
   const leadMax = Math.max(...Object.values(TIMING.lead));
@@ -404,7 +411,7 @@ export function planStage(birdId, opts = {}) {
   const seqI = {};
   let left = 0;
   let cur = null;
-  const endS = (opts.length ?? COURSE.length) - CHOREO.endPad;
+  const endS = (opts.length ?? CD.length) - CHOREO.endPad;
   while (sStart + (tq + leadMax) * f <= endS && slots.length < CHOREO.maxWaves) {
     const s = sStart + tq * f;
     const z = zoneAt(s);
@@ -412,7 +419,7 @@ export function planStage(birdId, opts = {}) {
     let pat = 'single';
     if (slots.length > 0 && phase !== 'rest') {
       if (left <= 0 || !cur || cur.phase !== phase) {
-        const seq = CHOREO.seq[phase] || CHOREO.seq.mid;
+        const seq = (CH.seq && CH.seq[phase]) || CHOREO.seq[phase] || CHOREO.seq.mid; // 16차 U10: 스테이지 무늬 덮어쓰기(S5 피날레 close 늘림, S1~S4 는 없음)
         seqI[phase] = seqI[phase] || 0;
         const it = seq[seqI[phase] % seq.length];
         seqI[phase]++;
@@ -429,7 +436,7 @@ export function planStage(birdId, opts = {}) {
       cur = null;
     }
     slots.push({ tq, s, zone: z.id, kind: phase === 'rest' ? 'rest' : phase === 'finale' ? 'finale' : 'mid', phase, pat });
-    const g = CHOREO.gap[phase] || CHOREO.gap.mid;
+    const g = CH.gap[phase] || CH.gap.mid;
     tq += ri(g[0], g[1]) * eighth;
   }
   // 구간 진행(0~1) → D 목표
@@ -438,13 +445,13 @@ export function planStage(birdId, opts = {}) {
   for (const sl of slots) {
     const q = span[sl.phase];
     const p = q[1] > q[0] ? (sl.tq - q[0]) / (q[1] - q[0]) : 0;
-    const T = D_TARGET[sl.phase] || D_TARGET.mid;
+    const T = CH.dTarget[sl.phase] || CH.dTarget.mid;
     sl.Dt = T[0] + (T[1] - T[0]) * p;
   }
   // ---------- ② 알 수 ----------
   for (const sl of slots) {
     if (sl.phase === 'finale') sl.nE = sl.pat === 'close' ? CHOREO.finaleMax : sl.pat === 'single' ? 1 : 2;
-    else sl.nE = R() < (CHOREO.double[sl.phase] || 0) && sl.pat !== 'single' ? 2 : 1;
+    else sl.nE = R() < (CH.double[sl.phase] || 0) && sl.pat !== 'single' ? 2 : 1;
   }
   // 대표 장면: 구간 가운데쯤(간격이 그 종류 정보 규칙을 지키는 자리)에 연속 n 웨이브, 앞뒤 1웨이브 목표 D × 0.6
   if (!opts.noScenes) {
@@ -490,7 +497,7 @@ export function planStage(birdId, opts = {}) {
   const pathCount = { out: 0, center: 0 };
   const clampEgg = (e) => e.w >= -7.5 && e.w <= 8.5 && Math.abs(e.u) <= 12.5;
   const pickKind = (phase, okFn) => {
-    const mix = BURST.mix[phase === 'rest' ? 'early' : phase] || BURST.mix.mid;
+    const mix = MIX[phase === 'rest' ? 'early' : phase] || MIX.mid;
     const ks = Object.keys(mix).filter((k) => mix[k] > 0 && okFn(k));
     if (!ks.length) return null;
     let tot = 0;
@@ -541,8 +548,9 @@ export function planStage(birdId, opts = {}) {
     let relax = 0; // 0: 모두 · 1: R5 풂 · 2: + R6 풂 · 3: + R3 풂
     let valid = 0;
     const want = sl.Dt;
-    const maxAll = CHOREO.triesMax;
+    const maxAll = CH.triesMax ?? CHOREO.triesMax; // 16차 U8: 스테이지가 후보 시도 상한을 늘릴 수 있다(S3 위아래 쌍이 많아 드물게 200번 안에 못 찾음 — S1·S2 는 그대로 200)
     let kindW = null;
+    const wWhy = {}; // 16차 U8: 이 웨이브의 후보 탈락 이유(실패 웨이브 점검용, 난수 없음)
     for (let k = 0; k < maxAll; k++) {
       if (cands.length >= CHOREO.cands || (cands.length >= 3 && k >= CHOREO.tries)) break; // 후보가 넉넉하면 끝
       if (k === CHOREO.tries && !cands.length) relax = 1;
@@ -550,9 +558,9 @@ export function planStage(birdId, opts = {}) {
       if (k === CHOREO.tries + 100 && !cands.length) relax = 3;
       tries++;
       log.tries++;
-      const why = (k2) => { const key = sl.phase + ':' + k2; log.why[key] = (log.why[key] || 0) + 1; };
-      // 주 알 종류는 웨이브마다 한 번(구간 비율대로) — 안 되면 완화 단계마다 한 번 다시
-      if (!kindW || k === CHOREO.tries || k === CHOREO.tries + 50 || k === CHOREO.tries + 100) kindW = sl.forceKind && infoOK(sl.forceKind) && k < CHOREO.tries + 100 ? sl.forceKind : pickKind(sl.phase, (kk) => infoOK(kk) && kk !== kindRun);
+      const why = (k2) => { const key = sl.phase + ':' + k2; log.why[key] = (log.why[key] || 0) + 1; wWhy[k2] = (wWhy[k2] || 0) + 1; };
+      // 주 알 종류는 웨이브마다 한 번(구간 비율대로) — 안 되면 완화 단계마다 한 번 다시. 16차 U8: 200번을 넘기는 스테이지(triesMax)는 그 뒤 40번마다 다시(S1·S2 는 200번 안에서 끝나 그대로)
+      if (!kindW || k === CHOREO.tries || k === CHOREO.tries + 50 || k === CHOREO.tries + 100 || (k >= CHOREO.triesMax && (k - CHOREO.triesMax) % 40 === 0)) kindW = sl.forceKind && infoOK(sl.forceKind) && k < CHOREO.tries + 100 ? sl.forceKind : pickKind(sl.phase, (kk) => infoOK(kk) && kk !== kindRun);
       const kindA = kindW;
       if (!kindA) { why('info'); continue; }
       const A = makeEgg(kindA, 0, 0, R);
@@ -603,9 +611,15 @@ export function planStage(birdId, opts = {}) {
         const X = makeEgg(kx, 0, 0, R);
         // 놓을 자리를 몇 번 뽑아 통로 범위 안에 드는 것
         let placed = false;
+        // 16차 U7(2-5): 좌우 비율 lr — 둘째 알을 첫 알 옆(좌우 쌍, |Δu| ≥ |Δw|)에 둘 비율. 정의된 스테이지만(S1 은 난수 흐름 그대로)
+        const wantH = CH.lr !== undefined && q === 1 ? R() < CH.lr : null;
         for (let t2 = 0; t2 < 8 && !placed; t2++) {
           const side = q === 1 ? (R() < 0.5 ? -1 : 1) : -eggs[1].side;
-          const ang = Math.atan2(dd[1], dd[0]) + side * (rand(60, 150) * Math.PI) / 180;
+          let ang = Math.atan2(dd[1], dd[0]) + side * (rand(60, 150) * Math.PI) / 180;
+          if (wantH !== null && (Math.abs(Math.cos(ang)) >= Math.abs(Math.sin(ang))) !== wantH) {
+            const base = wantH ? (Math.cos(ang) >= 0 ? 0 : Math.PI) : (Math.sin(ang) >= 0 ? Math.PI / 2 : -Math.PI / 2);
+            ang = base + ((R() - 0.5) * 70 * Math.PI) / 180;
+          }
           const gap = sl.forceKind === 'dahlia' ? rand(1.8, 3.0) : R() < 0.7 ? rand(-1.6, -0.4) : rand(1.7, 3.0); // 심 모란 벽: 사이 길
           const dist = Math.max(0.5, A.rout + X.rout + gap);
           X.u = A.u + Math.cos(ang) * dist;
@@ -723,6 +737,7 @@ export function planStage(birdId, opts = {}) {
     if (!best) {
       log.fails++;
       wave.failed = true;
+      wave.why = wWhy;
       wave.eggs = [];
       wave.target = P.slice();
       wave.T = 0;

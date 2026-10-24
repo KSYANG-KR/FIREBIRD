@@ -1,12 +1,15 @@
 // 화면 위 글자·버튼(HTML): 시작 화면, 새 선택, 숨 고르기, 엔딩, 랭킹, 게임 중 정보(HUD).
-import { BIRDS, BIRD_ORDER, STAGES, FOOD, POPUP, ROLL } from './config.js';
+import { BIRDS, BIRD_ORDER, POPUP, ROLL, STAGES, SCORING } from './config.js';
+import { displayName } from './ranking.js';
 
+// 17차 U2: iPhone 무음 안내는 iOS 기기에서만
+const IOS = typeof navigator !== 'undefined' && (/iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 export function formatTime(sec) {
   const s = Math.max(0, Math.floor(sec));
   const m = Math.floor(s / 60);
-  return m > 0 ? `${m}분 ${s % 60}초` : `${s}초`;
+  return `${m}:${String(s % 60).padStart(2, '0')}`; // 15차: m:ss
 }
 
 export function birdIcon(id) {
@@ -14,9 +17,10 @@ export function birdIcon(id) {
   return `<span class="bird-icon" style="--c:${b.color}" title="${esc(b.name)}">${esc(b.name[0])}</span>`;
 }
 
+// 17차 U2: 숫자 없이 막대만(SPEED · HP · HITBOX)
 function stat(label, value, max) {
   const pct = Math.round((value / max) * 100);
-  return `<div class="stat"><span>${label}</span><div class="bar"><i style="width:${pct}%"></i></div><b>${value}</b></div>`;
+  return `<div class="stat"><span>${label}</span><div class="bar"><i style="width:${pct}%"></i></div></div>`;
 }
 
 export class UI {
@@ -26,29 +30,43 @@ export class UI {
     root.innerHTML = `
       <div id="border"></div>
       <div id="hud" class="hidden">
-        <div class="hud-tl"><div class="stage-name"></div><div class="progress"><i></i></div><div class="phase"></div></div>
-        <div class="hud-tc"><div class="score"></div><div class="combo"><b class="cnum"></b><span class="cmul"></span></div><div class="near"></div><div class="judge"></div><div class="foodpop"></div></div>
+        <div class="hud-tl"><div class="progress"><i></i></div><div class="phase"></div></div>
+        <div class="hud-tc"><div class="score"></div><div class="combo"><b class="cnum"></b><span class="cmul"></span></div><div class="judge"></div><div class="foodpop"></div></div>
         <div class="hud-bl"><div class="hp-label"></div><div class="hpbar"><i></i><em></em></div></div>
-        <div class="hud-bc">
-          <div class="special roll"><span class="key">Space</span><span class="roll-name">급회피 롤</span><div class="gems">${'<b></b>'.repeat(ROLL.max)}</div></div>
+        <div class="hud-bc only-kb">
+          <div class="special roll"><span class="key">SPACE</span><span class="roll-name">ROLL</span><div class="gems">${'<b></b>'.repeat(ROLL.max)}</div></div>
         </div>
-        <div class="hud-help">방향키/WASD 이동 · 범위 원 밖 · 가운데 구멍 · Space 롤(최대 5) · Esc/P 일시정지 · M 소리</div>
+        <div class="tc only-touch">
+          <div class="tc-zone"></div>
+          <div class="tc-ring"></div><div class="tc-knob"></div>
+          <button class="tc-roll" type="button" aria-label="Roll"><span>ROLL</span><div class="tc-gems">${Array.from({ length: ROLL.max }, (_, i) => `<b style="--a:${(-60 + i * 30)}deg"></b>`).join('')}</div></button>
+          <button class="tc-pause" type="button" aria-label="Pause">II</button>
+          <div class="tc-hint hidden"><div class="h-stick"><i class="finger"></i><span>Drag to fly</span></div><div class="h-roll"><i class="finger"></i><span>Roll</span></div><div class="h-pause"><span>Pause</span></div></div>
+        </div>
       </div>
       <div id="vignette"></div>
       <div id="pops"></div>
       <div id="edges"></div>
       <div id="hint" class="hidden"></div>
       <div id="arrows"></div>
-      <div id="wow" class="hidden">와아아!</div>
+      <div id="wow" class="hidden">WOOOO!</div>
       <div id="toast"></div>
       <div id="banner" class="hidden"><div class="b-title"></div><div class="b-sub"></div></div>
       <div id="intro-text" class="hidden"></div>
       <div id="fps"></div>
-      <div id="loading" class="hidden"><span>그래픽 불러오는 중</span><div class="lbar"><i></i></div></div>
+      <div id="loading" class="hidden"><span>0%</span><div class="lbar"><i></i></div></div>
       <div id="dev" class="hidden"></div>
       <div id="notice" class="hidden"></div>
       <div id="screen" class="hidden"></div>
       <div id="pause" class="hidden"></div>
+      <div id="fade"></div>
+      <div id="stage-loading" class="hidden"><span></span></div>
+      <div id="rotate" class="hidden"><div class="panel rotate-panel">
+        <div class="rot-icon" aria-hidden="true"></div>
+        <p>Rotate to landscape.</p>
+        <small class="rot-sub">Rotation lock must be off.</small>
+        <div class="buttons"><button data-act="quit">MENU</button></div>
+      </div></div>
     `;
     this.$ = (sel) => root.querySelector(sel);
     this.hud = this.$('#hud');
@@ -67,6 +85,24 @@ export class UI {
     this.pops = []; // 11차 새 옆 팝업 글자
     this.popXY = null;
     this.clock = () => performance.now(); // 11차: 팝업 시계(게임이 게임 시각으로 바꿔 끼움 — 일시정지·점검 단계 진행과 맞게)
+    // 16차 3-1: 터치 조작 부품(input.js 가 붙인다)
+    this.tc = { zone: this.$('.tc-zone'), ring: this.$('.tc-ring'), knob: this.$('.tc-knob'), roll: this.$('.tc-roll'), pause: this.$('.tc-pause'), hint: this.$('.tc-hint') };
+    this.rotateEl = this.$('#rotate');
+    this.view = null; // 16차 3-2: 3D 화면 자리 { top, h }(4:3 보다 좁으면 위아래 검은 띠) — 렌더러가 알려 준다
+    // 16차 3-2: 가상 키보드가 이름 칸을 가리지 않게 — 보이는 높이(visualViewport)만큼 판을 올린다
+    if (typeof window !== 'undefined' && window.visualViewport) {
+      const vv = window.visualViewport;
+      const fit = () => {
+        const kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        root.style.setProperty('--kb', `${Math.round(kb)}px`);
+        const a = document.activeElement;
+        if (kb > 40 && a && a.id === 'nick') {
+          try { a.scrollIntoView({ block: 'center' }); } catch { /* 그만 */ }
+        }
+      };
+      vv.addEventListener('resize', fit);
+      vv.addEventListener('scroll', fit);
+    }
 
     root.addEventListener('click', (e) => {
       const el = e.target.closest('[data-act]');
@@ -104,126 +140,248 @@ export class UI {
     this.screen.innerHTML = '';
   }
 
+  // 15차: 옵션은 3개만(Sound · Reduce Motion · Low Graphics). 빛 번짐은 Low Graphics 에 합침
   options(settings) {
-    const box = (key, label, hint) =>
-      `<label class="opt"><input type="checkbox" data-opt="${key}" ${settings[key] ? 'checked' : ''}/> <span>${label}</span>${hint ? `<small>${hint}</small>` : ''}</label>`;
+    const box = (key, label) =>
+      `<label class="opt"><input type="checkbox" data-opt="${key}" ${settings[key] ? 'checked' : ''}/> <span>${label}</span></label>`;
     return `<div class="options">
-      ${box('reduceMotion', '흔들림 줄이기', '화면 기울기·시야 튐·흔들림·퍼펙트 슬로모 끔')}
-      ${box('bloom', '빛 번짐(블룸)', '')}
-      ${box('lowSpec', '저사양 모드', '블룸 끔 · 불씨 절반 · 해상도 낮춤')}
-      ${box('sound', '소리', 'M 키로도 켜고 끔')}
+      ${box('sound', 'Sound')}
+      ${box('reduceMotion', 'Reduce Motion')}
+      ${box('lowSpec', 'Low Graphics')}
+      ${IOS ? '<div class="opt-touch">iPhone: turn off silent mode for sound.</div>' : ''}
     </div>`;
   }
 
-  showTitle({ settings, touch, top, dev, gpuWarn = false }) {
-    const rows = top.length
-      ? top.map((e, i) => `<li><b>${i + 1}</b>${birdIcon(e.bird)}<span>${esc(e.name)}${(e.ver || 0) >= 6 ? "" : " <small class=\"old\">v5 이전</small>"}</span><em>${e.score.toLocaleString()}</em></li>`).join('')
-      : '<li class="empty">아직 기록이 없어요.</li>';
-    this._show(`
-      <div class="panel title-panel">
-        <h1>Birds vs Fireworks</h1>
-        <p class="sub">사람에게는 축제, 새에게는 악몽. 도심의 불꽃놀이를 피해 끝까지 날아 보세요.</p>
-        <div class="warning">
-          <b>광과민성 발작 경고</b>
-          이 게임에는 불꽃의 빛과 밝기 변화가 나옵니다. 빛에 민감하거나 발작을 겪은 적이 있다면 플레이하지 마세요.
-          하다가 어지럽거나 눈이 불편하면 바로 멈추고 쉬세요.
-        </div>
-        ${gpuWarn ? `<div class="gpu-note" id="gpu-note">
-          <b>그래픽 가속이 꺼져 있습니다. 크롬 설정 → 시스템 → '가능한 경우 그래픽 가속 사용'을 켜고 크롬을 다시 시작하세요.</b>
-          엣지로 열어도 됩니다.
-          <div class="gpu-row"><code>chrome://settings/system</code><button data-act="gpu-copy">주소 복사</button><button data-act="gpu-close">닫기</button></div>
-          <small>지금은 품질을 자동으로 낮췄어요(빛 번짐 끔 · 장식 불꽃 절반 · 물 반사 끔 · 해상도 낮춤).</small>
-        </div>` : ''}
-        ${touch ? '<div class="touch-note">이 게임은 PC 키보드로 즐겨 주세요. 휴대폰·태블릿 터치 조작은 아직 없어요.</div>' : ''}
-        ${this.options(settings)}
-        <div class="buttons">
-          <button class="primary" data-act="start">시작하기</button>
-          <button data-act="ranking">랭킹 보기</button>
-        </div>
-        <div class="mini-rank"><div class="mini-title">이 브라우저의 캐주얼 랭킹 상위 10 (이어하기 없는 기록)</div><ol>${rows}</ol></div>
-        <div class="controls">조작: 방향키 또는 WASD 이동 — 불꽃이 올라가면 바로 점선 「범위 원」이 뜨고 약 1초 뒤 새가 닿는 순간 터집니다(원 안 = 모두 위험). 피하는 길은 둘: 원 밖으로 · 가운데 구멍으로(구멍이 있는 불꽃만, 하얀 작은 고리 = 내 새가 지날 자리, 점수 큼) · 민트 고리 먹이 = HP 회복 · 시안 깃털 = 롤 +1 · Space 급회피 롤(시작 3개 · 최대 5개, 가득일 때 먹으면 +200점) · Esc/P 일시정지 · M 소리 끄기/켜기${dev ? ' · [개발] N 스테이지 건너뛰기, G 무적, B 판정 띠' : ''}</div>
-      </div>`, 'screen-title');
+  // 순위 목록 한 벌(TOP 10). 이름 규칙에 맞지 않는 옛 이름은 표시만 "Player". 15차까지 옛 기록(legacy)은 "v15" 작은 표시
+  // highlight = 내 기록 id(문자열) 또는 id 집합(Set)
+  rankList(entries, highlight = null) {
+    if (!entries.length) return '<div class="rank-empty">No records yet.</div>';
+    const mine = (id) => (highlight instanceof Set ? highlight.has(id) : id === highlight);
+    return `<table class="rank-table"><tr><th>#</th><th>NAME</th><th>SCORE</th><th title="Retries">↺</th></tr>${entries
+      .map((e, i) => `<tr class="${mine(e.id) ? 'me' : ''}"><td>${i + 1}</td><td>${birdIcon(e.bird)} ${esc(displayName(e.name))}</td><td>${e.score.toLocaleString()}</td><td>${e.continues}</td></tr>`)
+      .join('')}</table>`;
   }
 
-  showSelect({ selected }) {
-    const maxF = 14, maxL = 10, maxH = Math.max(...BIRD_ORDER.map((id) => BIRDS[id].hp));
+  // 16차 4-6: TOP 10 탭 — [FULL RUN](안에 NO RETRY 기본 / ALL) · [S1]~[S5](안에 RUN 기본 / PRACTICE)
+  rankTabs(tabs) {
+    const t = tabs || { tab: '1', sub: 'run' };
+    const b = (act, attrs, label, on) => `<button class="rtab ${on ? 'on' : ''}" data-act="${act}" ${attrs}>${label}</button>`;
+    const st = STAGES.map((s) => b('rank-tab', `data-tab="${s.id}"`, `S${s.id}`, t.tab === String(s.id))).join('');
+    const top = `<div class="rank-tabs">${b('rank-tab', 'data-tab="full"', 'FULL RUN', t.tab === 'full')}${st}</div>`;
+    const subs = t.tab === 'full'
+      ? [['clean', 'NO RETRY'], ['all', 'ALL']]
+      : [['run', 'RUN'], ['practice', 'PRACTICE']];
+    const sub = `<div class="rank-subs">${subs.map(([k, label]) => b('rank-tab', `data-tab="${t.tab}" data-sub="${k}"`, label, t.sub === k)).join('')}</div>`;
+    return top + sub;
+  }
+
+  // ---------- 15차 C-2: 전체 화면 타이틀 ----------
+  // animate = 이 페이지에서 처음(연출) / false = 일시정지 Quit 으로 돌아옴(마지막 장면 그대로)
+  showTitle({ settings, touch, gpuWarn = false, animate = true, reduceMotion = false }) {
+    const letters = (word) => [...word].map((c, i) => `<span class="tl" style="--i:${i}">${c}</span>`).join('');
+    this._show(`
+      <div class="title-full ${animate ? 'anim' : 'still'} ${reduceMotion ? 'rm' : ''}" data-act="title-go">
+        <div class="t-fade"></div>
+        <div class="t-block">
+          <div class="t-line t1 game-title">${letters('FIREWORK')}</div>
+          <div class="t-line t2 game-title">${letters('SURVIVAL')}</div>
+          <div class="t-sub">Fun for people. A nightmare for birds.</div>
+          <div class="t-load"><div class="t-lbar"><i></i></div><span>0%</span></div>
+          <div class="t-press"><span class="only-kb">PRESS ANY KEY</span><span class="only-touch">TAP TO START</span></div>
+        </div>
+        ${gpuWarn ? `<div class="gpu-note" id="gpu-note"><b>Turn on hardware acceleration, then restart Chrome.</b>
+          <div class="gpu-row"><code>chrome://settings/system</code><button data-act="gpu-copy">COPY</button><button data-act="gpu-close">CLOSE</button></div></div>` : ''}
+        <div class="t-warn">⚠ Flashing lights. Don't play if you have photosensitive epilepsy.</div>
+      </div>`, 'screen-title');
+    this.fitTitle();
+    this.setLoading(this._loadP ?? 0);
+    if (!this._fitOn) {
+      this._fitOn = true;
+      window.addEventListener('resize', () => this.fitTitle());
+    }
+  }
+
+  // 제목 두 줄이 창 폭의 약 85% 를 채우게(높이는 창의 70% 안). FIREWORK 는 글자 크기로, SURVIVAL 은 작은 글자 + 넓은 자간으로 같은 폭
+  fitTitle() {
+    const t1 = this.root.querySelector('.title-full .t1');
+    const t2 = this.root.querySelector('.title-full .t2');
+    if (!t1 || !t2) return;
+    const W = window.innerWidth, H = window.innerHeight;
+    const c = this._mc || (this._mc = document.createElement('canvas').getContext('2d'));
+    const fam = getComputedStyle(t1).fontFamily;
+    c.font = `100px ${fam}`;
+    const w1 = c.measureText('FIREWORK').width / 100;
+    const w2 = c.measureText('SURVIVAL').width / 100;
+    const target = W * 0.85;
+    let f1 = target / w1;
+    const f2r = 0.66;
+    // 16차 3-2: 낮은 화면(휴대폰 가로)은 제목이 부제·TAP TO START·경고 줄과 겹치지 않게 높이의 40% 까지
+    f1 = Math.min(f1, (H * (H <= 500 ? 0.4 : 0.7)) / (0.95 * (1 + f2r)));
+    const f2 = f1 * f2r;
+    const tw = f1 * w1;
+    const ls = Math.max(0, (tw - f2 * w2) / 8);
+    t1.style.fontSize = `${f1.toFixed(1)}px`;
+    t2.style.fontSize = `${f2.toFixed(1)}px`;
+    t2.style.letterSpacing = `${ls.toFixed(1)}px`;
+    t2.style.marginRight = `${(-ls).toFixed(1)}px`;
+    this.titleFit = { W, H, f1: +f1.toFixed(1), f2: +f2.toFixed(1), widthFrac: +(tw / W).toFixed(3) };
+  }
+
+  // ---------- 새 고르기 ----------
+  // 16차 2-6: 스테이지 칩 한 줄 — [1] FULL RUN(기본) / [2]~[5] PRACTICE. 잠긴 칩은 자물쇠 + "Clear stage N−1", 아직 없는 스테이지는 "Coming soon"
+  stageChips(stages, sel) {
+    if (!stages || !stages.length) return '';
+    const chip = (s) => {
+      const ok = s.unlocked && s.playable;
+      // 17차 U2: 칩에는 숫자만. 잠긴 칩은 자물쇠 + 작은 「Clear S1」, 아직 없는 스테이지는 흐린 칩. 고른 칩의 종류(FULL RUN / PRACTICE)는 줄 오른쪽 한 단어
+      const sub = !s.unlocked ? `<span><i class="lock" aria-hidden="true"></i>Clear S${s.id - 1}</span>` : '';
+      return `<button class="schip ${s.id === sel ? 'on' : ''} ${ok ? '' : 'locked'} ${s.playable ? '' : 'soon'}" data-act="stage" data-stage="${s.id}" ${ok ? '' : 'disabled'} title="${esc(s.name)}"><b>${s.id}</b>${sub}</button>`;
+    };
+    return `<div class="stage-row"><span class="sr-label">STAGE</span><div class="schips">${stages.map(chip).join('')}</div><span class="sr-kind">${sel === 1 ? 'FULL RUN' : 'PRACTICE'}</span></div>`;
+  }
+
+  showSelect({ selected, best = 0, top = [], tabs = null, settings, showTop = false, showOpts = false, stages = null, selStage = 1 }) {
+    const maxL = Math.max(...BIRD_ORDER.map((id) => BIRDS[id].lateral)), maxH = Math.max(...BIRD_ORDER.map((id) => BIRDS[id].hp));
+    const maxR = Math.max(...BIRD_ORDER.map((id) => BIRDS[id].radius));
     const cards = BIRD_ORDER.map((id) => {
       const b = BIRDS[id];
-      const sp = b.special;
       return `<button class="bird-card ${id === selected ? 'sel' : ''}" data-act="pick" data-bird="${id}">
-        <div class="bc-head">${birdIcon(id)}<b>${esc(b.name)}</b><small>${esc(b.role)}</small></div>
-        ${stat('전진', b.forward, maxF)}
-        ${stat('옆·위아래', b.lateral, maxL)}
+        <div class="bc-head">${birdIcon(id)}<b>${esc(b.name)}</b></div>
+        <div class="bc-tag">${esc(b.role)}</div>
+        ${stat('SPEED', b.lateral, maxL)}
         ${stat('HP', b.hp, maxH)}
-        ${stat('맞는 범위', b.radius, 1)}
-        <small class="fav-food">HP 먹이: ${esc(FOOD.kinds[FOOD.fav[id]].label)}(민트 고리) · 롤 먹이: 시안 깃털</small>
+        ${stat('HITBOX', b.radius, maxR)}
       </button>`;
     }).join('');
     this._show(`
       <div class="panel select-panel">
-        <h2>어떤 새로 날까요?</h2>
+        ${showOpts ? this.options(settings) : ''}
         <div class="cards">${cards}</div>
-        <div class="stage-strip">${STAGES.map((st) => st.playable
-    ? `<div class="stage-chip open"><b>STAGE ${st.id}</b><span>${esc(st.name)}</span><small>약 ${st.duration}초</small></div>`
-    : `<button class="stage-chip locked" data-act="locked"><b>STAGE ${st.id}</b><span>${esc(st.name)}</span><small>준비 중</small></button>`).join('')}</div>
-        <div class="hint">←/→ 로 고르고 Enter, 또는 카드를 누르세요. 맞는 범위가 작을수록 피하기 쉽습니다.</div>
-        <div class="buttons">
-          <button class="primary" data-act="fly">이 새로 날기</button>
-          <button data-act="back">처음 화면</button>
+        ${this.stageChips(stages, selStage)}
+        <div class="sel-row">
+          <div class="best">BEST <b>${best.toLocaleString()}</b> <button class="small" data-act="top">TOP 10</button>
+            <button class="gear ${showOpts ? 'on' : ''}" data-act="gear" title="Options" aria-label="Options">⚙</button></div>
+          <button class="primary fly" data-act="fly">FLY</button>
         </div>
+        ${showTop ? `<div class="top-box">${this.rankTabs(tabs)}${this.rankList(top)}<div class="opt-note">Saved on this device.</div></div>` : ''}
+        <div class="keys only-kb"><span><kbd>WASD</kbd>/<kbd>←↑→↓</kbd> Move</span><span><kbd>SPACE</kbd> Roll</span><span><kbd>ESC</kbd> Pause</span><span><kbd>M</kbd> Sound</span></div>
       </div>`, 'screen-select');
   }
 
-  showInterlude({ stage, rec, hpBefore, hpAfter, maxHp, next, total, isLast }) {
+  // 17차 U1 추락 결과: 갈색 판 없이 통닭 장면 위, 아래에서 올라오는 그러데이션 위에 글. 주인공은 핵심 문구(Anton) 하나.
+  //   YOU FELL(0) → 핵심(0.3) → 변주 한 줄(0.9) → 기록(1.4) → 버튼(1.7), 각 0.3초 서서히. 키를 누르면 바로 전부
+  //   기록 = 진행 막대 + % + SCORE(비행 시간·Hits 는 뺌). 휴대폰 가로는 기록을 머리말 옆에, 이름 칸·SAVE 는 버튼 줄 오른쪽(style.css)
+  // 16차 2-6: cont = CONTINUE(작은 「S2」) + START OVER, 아니면 TRY AGAIN. canSave = 지금까지 깬 스테이지 기록 저장(선택, 이름 칸에 커서가 있을 때만 Enter = SAVE)
+  showEnding({ joke, fact, progress = 0, score, cont = false, stageN = 1, canSave = false }) {
+    let last = '';
+    try { last = localStorage.getItem('bvf.lastName') || ''; } catch { /* 없으면 빈 칸 */ }
+    const save = canSave ? `<form class="register save-stages" autocomplete="off">
+            <div class="row"><input id="nick" maxlength="24" placeholder="NAME" aria-label="Name" value="${esc(last)}" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done"/><button type="submit">SAVE</button></div>
+            <div class="reg-msg"></div>
+          </form>` : '';
+    const enter = '<small class="kb-enter only-kb" aria-hidden="true">↵</small>';
+    const buttons = cont
+      ? `<button class="primary" data-act="retry">CONTINUE <small class="e-sn">S${stageN}</small>${enter}</button>
+            <button data-act="start-over">START OVER</button>
+            <button data-act="restart">CHANGE BIRD</button>`
+      : `<button class="primary" data-act="retry">TRY AGAIN${enter}</button>
+            <button data-act="restart">CHANGE BIRD</button>`;
+    const pct = Math.round(Math.max(0, Math.min(1, progress)) * 100);
     this._show(`
-      <div class="panel interlude">
-        <div class="kicker">STAGE ${stage.id} 완주</div>
-        <h2>${esc(stage.name)}</h2>
-        <table class="score-table">
-          <tr><td>완주</td><td>${(1000 * stage.id).toLocaleString()}</td></tr>
-          <tr><td>퍼펙트 ${rec.perfect ?? 0}회 · 스침 ${rec.graze ?? 0}회 · 최대 콤보 ${rec.maxChain ?? 0}</td><td>${(rec.bonus ?? 0).toLocaleString()}</td></tr>
-          <tr><td>남은 HP ${Math.ceil(rec.hpEnd)}</td><td>${(Math.ceil(rec.hpEnd) * 10).toLocaleString()}</td></tr>
-          <tr><td>무피격</td><td>${rec.hits === 0 ? '500' : '0'}</td></tr>
-          <tr class="sum"><td>스테이지 점수</td><td>${rec.score.toLocaleString()}</td></tr>
-          <tr class="sum"><td>누적 점수</td><td>${total.toLocaleString()}</td></tr>
-        </table>
-        ${isLast ? '' : `<p class="heal">숨 고르기: HP ${Math.ceil(hpBefore)} → <b>${Math.ceil(hpAfter)}</b> / ${maxHp} (최대치의 30% 회복)</p>
-        <p class="next">다음: STAGE ${next.id} ${esc(next.name)} · ${next.duration}초</p>`}
-        <div class="buttons"><button class="primary" data-act="next">${isLast ? '결과 보기' : '다음 스테이지'} (Enter)</button></div>
-      </div>`, 'screen-interlude');
-  }
-
-  showEnding({ joke, fact, stage, time, hits, score }) {
-    this._show(`
-      <div class="ending-text">
-        <p class="joke">${esc(joke)}</p>
-        <div class="record">STAGE ${stage.id} ${esc(stage.name)}에서 추락 · 비행 ${esc(formatTime(time))} · 맞은 횟수 ${hits} · 점수 ${score.toLocaleString()}</div>
-        <p class="fact">${esc(fact)}</p>
-        <div class="buttons">
-          <button class="primary" data-act="retry">이 스테이지 다시 (그 스테이지 시작 HP로)</button>
-          <button data-act="restart">처음부터</button>
+      <div class="end-wrap fell">
+        <div class="end-card">
+          <div class="e-kicker">YOU FELL</div>
+          <p class="e-core">${esc(fact)}</p>
+          <p class="e-line">${esc(joke)}</p>
+          <div class="e-rec"><span class="e-bar" aria-hidden="true"><i style="width:${pct}%"></i></span><span class="e-pct">${pct}%</span><span class="e-score"><small>SCORE</small> <b>${score.toLocaleString()}</b></span></div>
+          <div class="e-actions">
+            <div class="buttons">
+            ${buttons}
+            </div>
+            ${save}
+          </div>
         </div>
       </div>`, 'screen-ending');
   }
 
-  showVictory({ line, fact, total, records, continues, bird, time }) {
-    const rows = records.map((r) => `<tr><td>${r.id}. ${esc(STAGES[r.id - 1].name)}</td><td>${r.score.toLocaleString()}</td></tr>`).join('');
+  // 17차 U1 클리어 결과: YOU SURVIVED → 핵심 → 변주 → TOTAL 줄(새 아이콘 · TOTAL · 숫자 · 시간) → 이름 칸 + SAVE → (저장 뒤) TOP 10 → 버튼
+  //   점수 내역표는 스테이지 카드에서 보므로 뺀다. 「YOUR NAME」 이름표도 없음(빈 칸 안내 NAME)
+  showVictory({ line, fact, total, bird, time }) {
     this._show(`
-      <div class="panel victory">
-        <div class="kicker">최종 클리어</div>
-        <h2>${esc(line)}</h2>
-        <p class="fact">${esc(fact)}</p>
-        <table class="score-table">${rows}
-          <tr class="sum"><td>합계 ${birdIcon(bird)} 이어하기 ${continues}회 · ${esc(formatTime(time))}</td><td>${total.toLocaleString()}</td></tr>
-        </table>
-        <form class="register" autocomplete="off">
-          <label>닉네임 (2~12자, 한글·영문·숫자)</label>
-          <div class="row"><input id="nick" maxlength="24" placeholder="닉네임"/><button class="primary" type="submit">랭킹에 등록</button></div>
-          <div class="reg-msg"></div>
-          <small>캐주얼 랭킹: 이 브라우저에만 저장되는 재미용 순위입니다. 조작을 완전히 막지는 못합니다.</small>
-        </form>
-        <div class="buttons"><button data-act="ranking">랭킹 보기</button><button data-act="restart">처음부터</button></div>
+      <div class="end-wrap clear">
+        <div class="end-card">
+          <div class="e-kicker">YOU SURVIVED</div>
+          <p class="e-core">${esc(fact)}</p>
+          <p class="e-line">${esc(line)}</p>
+          <div class="e-total">${birdIcon(bird)}<small>TOTAL</small><b>${total.toLocaleString()}</b><small class="e-time">${esc(formatTime(time))}</small></div>
+          <form class="register" autocomplete="off">
+            <div class="row"><input id="nick" maxlength="24" placeholder="NAME" aria-label="Name" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="done"/><button class="primary" type="submit">SAVE</button></div>
+            <div class="reg-msg"></div>
+          </form>
+          <div class="top-box hidden"></div>
+          <div class="buttons">
+            <button class="primary" data-act="again">PLAY AGAIN</button>
+            <button data-act="restart">CHANGE BIRD</button>
+          </div>
+        </div>
       </div>`, 'screen-victory');
+    const nick = this.root.querySelector('#nick');
+    if (nick) {
+      // 16차: 마지막에 쓴 이름을 미리 채운다(bvf.lastName)
+      try { const last = localStorage.getItem('bvf.lastName'); if (last) nick.value = last; } catch { /* 없으면 빈 칸 */ }
+      setTimeout(() => nick.focus(), 0);
+    }
+  }
+
+  // 17차 U1 「STAGE n CLEAR」 카드(어두운 판 유지 — 게임 화면 위에 뜬다): 머리말 → 스테이지 점수(Anton) → 작은 2×2 칸(Clear | HP / Bonus | No-hit) → TOTAL → +30% HP
+  //   버튼 [NEXT](밑에 작은 「S2 · Sign Alley」, Enter·탭, 8초 뒤 자동) / [QUIT]. 마지막 스테이지는 [RESULTS] 하나(자동 없음)
+  showStageClear({ rec, total, heal, next }) {
+    const S = SCORING;
+    const cell = (k, v) => `<span class="sc-cell"><span>${k}</span><b>${v}</b></span>`;
+    const enter = '<small class="kb-enter only-kb" aria-hidden="true">↵</small>';
+    this._show(`
+      <div class="end-wrap card-wrap">
+        <div class="end-card stage-card">
+          <div class="e-kicker">STAGE ${rec.id} CLEAR</div>
+          <div class="sc-score">${(rec.score ?? 0).toLocaleString()}</div>
+          <div class="sc-grid">
+            ${cell('Clear', (S.clearPerStage * rec.id).toLocaleString())}${cell('HP', (Math.ceil(rec.hpEnd) * S.hpPoint).toLocaleString())}
+            ${cell('Bonus', (rec.bonus ?? 0).toLocaleString())}${cell('No-hit', (rec.hits === 0 ? S.noHitBonus : 0).toLocaleString())}
+          </div>
+          <div class="sc-total"><small>TOTAL</small> <b>${total.toLocaleString()}</b></div>
+          ${next ? `<div class="e-heal">+${Math.round(heal * 100)}% HP</div>
+          <div class="buttons">
+            <button class="primary sc-next" data-act="next"><span>NEXT${enter}</span><small class="sc-sub">S${next.id} · ${esc(next.name)}</small></button>
+            <button data-act="clear-quit">QUIT</button>
+          </div>` : `<div class="buttons">
+            <button class="primary" data-act="see-results">RESULTS${enter}</button>
+          </div>`}
+        </div>
+      </div>`, 'screen-victory screen-stageclear');
+  }
+
+  // 16차 4-6: 추락 판 「Save stage scores」 저장 뒤 — 이름 칸을 잠그고 결과를 알림(이후 Enter = CONTINUE)
+  stageScoresSaved(msg, ok) {
+    const f = this.root.querySelector('.save-stages');
+    if (f) {
+      const inp = f.querySelector('input');
+      if (inp) { inp.disabled = true; inp.blur(); }
+      const b = f.querySelector('button');
+      if (b) b.disabled = true;
+    }
+    this.setRegisterMessage(msg, ok);
+  }
+
+  // 16차 2-6: 스테이지 전환 0.6초 검게(on) / 다시 밝게(off)
+  fade(on) {
+    const el = this.$('#fade');
+    if (el) el.classList.toggle('on', !!on);
+  }
+
+  // 키를 누르면 엔딩 글을 바로 전부 보인다
+  revealAll() {
+    const c = this.root.querySelector('.end-card');
+    if (c && !c.classList.contains('all')) c.classList.add('all');
   }
 
   setRegisterMessage(msg, ok = false) {
@@ -234,21 +392,23 @@ export class UI {
     }
   }
 
-  showRanking({ entries, tab, highlightId, from }) {
-    const rows = entries.length
-      ? entries.map((e, i) => `<tr class="${e.id === highlightId ? 'me' : ''}"><td>${i + 1}</td><td>${birdIcon(e.bird)} ${esc(e.name)}${(e.ver || 0) >= 6 ? "" : " <small class=\"old\">v5 이전</small>"}</td><td>${e.score.toLocaleString()}</td><td>${e.continues}</td><td>${new Date(e.at).toLocaleDateString()}</td></tr>`).join('')
-      : '<tr><td colspan="5" class="empty">아직 기록이 없어요. 5스테이지를 모두 버티면 등록할 수 있어요.</td></tr>';
-    this._show(`
-      <div class="panel ranking">
-        <h2>캐주얼 랭킹</h2>
-        <p class="sub">이 브라우저에만 저장되는 재미용 순위입니다. 조작을 완전히 막지는 못합니다.</p>
-        <div class="tabs">
-          <button class="${tab === 'clean' ? 'on' : ''}" data-act="tab" data-tab="clean">이어하기 없이</button>
-          <button class="${tab === 'all' ? 'on' : ''}" data-act="tab" data-tab="all">이어하기 포함</button>
-        </div>
-        <table class="rank-table"><tr><th>순위</th><th>닉네임</th><th>점수</th><th>이어하기</th><th>날짜</th></tr>${rows}</table>
-        <div class="buttons"><button class="primary" data-act="${from === 'victory' ? 'restart' : 'back'}">${from === 'victory' ? '처음부터' : '처음 화면'}</button></div>
-      </div>`, 'screen-ranking');
+  // 저장한 뒤: 그 자리에 TOP 10 을 펼치고 내 줄을 강조, 이름 칸은 잠근다(이후 Enter = PLAY AGAIN)
+  // 16차: tabs = TOP 10 탭 상태, note = { msg, ok } (순위 밖이면 "Saved, but not in the top 100." 등)
+  showSaved(entries, myIds, tabs = null, note = null) {
+    const f = this.root.querySelector('.register');
+    if (f) {
+      const inp = f.querySelector('input');
+      if (inp) { inp.disabled = true; inp.blur(); }
+      const b = f.querySelector('button');
+      if (b) b.disabled = true;
+    }
+    this.setRegisterMessage(note ? note.msg : 'Saved.', note ? note.ok : true);
+    const box = this.root.querySelector('.top-box');
+    if (box) {
+      box.classList.remove('hidden');
+      box.innerHTML = this.rankTabs(tabs) + this.rankList(entries, myIds);
+      try { box.scrollIntoView({ block: 'nearest' }); } catch { /* 낮은 화면에서 목록이 보이게(실패해도 그만) */ }
+    }
   }
 
   showPause(show, settings) {
@@ -260,10 +420,33 @@ export class UI {
     this.pause.className = '';
     this.pause.innerHTML = `
       <div class="panel pause-panel">
-        <h2>일시정지</h2>
+        <h2>PAUSED</h2>
+        <div class="buttons"><button class="primary" data-act="resume">RESUME</button><button data-act="restart-run">RESTART</button><button data-act="quit">QUIT</button></div>
         ${this.options(settings)}
-        <div class="buttons"><button class="primary" data-act="resume">계속 (Esc)</button><button data-act="quit">처음 화면으로</button></div>
       </div>`;
+  }
+
+  // 16차 3-2: 세로 화면 판(플레이 중 세로가 되면). QUIT TO MENU 는 data-act="quit"
+  showRotate(v) {
+    if (this.rotateEl.classList.contains('hidden') === !v) return;
+    this.rotateEl.classList.toggle('hidden', !v);
+  }
+
+  // 16차 3-4: 「Loading STAGE n」(빈 글이면 숨김)
+  stageLoading(text) {
+    const el = this.$('#stage-loading');
+    if (!el) return;
+    el.classList.toggle('hidden', !text);
+    el.firstChild.textContent = text || '';
+  }
+
+  // 16차 3-1: 첫 플레이 4초 동안 스틱 자리·ROLL 위에 반투명 손가락 그림
+  touchHint() {
+    const el = this.tc.hint;
+    if (!el) return;
+    el.classList.remove('hidden');
+    clearTimeout(this._thT);
+    this._thT = setTimeout(() => el.classList.add('hidden'), 4000);
   }
 
   // ---------- 게임 중 정보 ----------
@@ -281,13 +464,11 @@ export class UI {
 
   updateHud(d) {
     const $ = this.$;
-    this._set('stage', $('.stage-name'), `STAGE ${d.stage.id} · ${d.stage.name}`);
     this._set('prog', $('.progress i'), `${Math.min(100, (d.elapsed / d.stage.duration) * 100).toFixed(1)}%`, 'width');
-    this._set('phase', $('.phase'), `${['도입', '본공연', '피날레'][d.phase] || ''} · 남은 ${Math.max(0, Math.ceil(d.stage.duration - d.elapsed))}초`);
-    this._set('score', $('.score'), `점수 ${d.score.toLocaleString()}`);
-    this._set('cnum', $('.cnum'), d.combo > 0 ? `콤보 ${d.combo}` : '');
+    this._set('phase', $('.phase'), formatTime(Math.max(0, Math.ceil(d.stage.duration - d.elapsed))));
+    this._set('score', $('.score'), d.score.toLocaleString());
+    this._set('cnum', $('.cnum'), d.combo > 0 ? `COMBO ${d.combo}` : '');
     this._set('cmul', $('.cmul'), d.mult > 1 ? ` ×${d.mult}` : '');
-    this._set('near', $('.near'), d.center !== undefined ? `센터 ${d.center} · 타이밍 ${d.timing || 0} · 스침 ${d.graze} · HP 먹이 ${d.hpFood || 0} · 롤 먹이 ${d.rollFood || 0} · 맞음 ${d.hits}` : `퍼펙트 ${d.perfect} · 스침 ${d.graze} · 맞음 ${d.hits}`);
     // 11차: HP 먹이를 먹으면 숫자가 0.4초 동안 올라가며 센다
     let hpShow = d.hp;
     const HA = this._hpAnim;
@@ -296,7 +477,7 @@ export class UI {
       hpShow = HA.from + (HA.to - HA.from) * k;
       if (k >= 1) this._hpAnim = null;
     }
-    this._set('hpl', $('.hp-label'), `${d.birdName} HP ${Math.ceil(hpShow)} / ${d.maxHp}${d.god ? ' [무적]' : ''}`);
+    this._set('hpl', $('.hp-label'), `HP ${Math.ceil(hpShow)}/${d.maxHp}${d.god ? ' [GOD]' : ''}`);
     const hpPct = `${Math.max(0, (d.hp / d.maxHp) * 100).toFixed(1)}%`;
     this._set('hp', $('.hpbar i'), hpPct, 'width');
     this.hud.classList.toggle('low-hp', d.hp / d.maxHp < 0.3);
@@ -304,6 +485,7 @@ export class UI {
     if (d.rolls !== undefined && this.hudCache.rolls !== d.rolls) {
       this.hudCache.rolls = d.rolls;
       $('.roll .gems').querySelectorAll('b').forEach((el, i) => el.classList.toggle('on', i < d.rolls));
+      $('.tc-gems').querySelectorAll('b').forEach((el, i) => el.classList.toggle('on', i < d.rolls)); // 16차: 터치 ROLL 버튼 둘레
     }
     this.hud.classList.toggle('sp-ready', true);
     this.hud.classList.toggle('roll-ready', !d.rolling && d.rollCd <= 0 && d.rolls > 0);
@@ -312,17 +494,25 @@ export class UI {
 
   // 실사 그래픽 에셋 불러오기 진행률(0~1). 다 되면 숨긴다. 못 읽은 파일이 있으면 잠깐 알린다(코드 그래픽으로 대신함).
   setLoading(p, failed = []) {
+    this._loadP = p;
+    const tl = this.root.querySelector('.title-full .t-load');
+    if (tl) {
+      tl.classList.toggle('done', p >= 1);
+      tl.querySelector('i').style.width = `${Math.round(p * 100)}%`;
+      tl.querySelector('span').textContent = `${Math.round(p * 100)}%`;
+    }
     const el = this.root.querySelector('#loading');
     if (!el) return;
-    el.classList.toggle('hidden', p >= 1);
+    el.classList.toggle('hidden', p >= 1 || !!tl); // 15차: 타이틀이 떠 있으면 타이틀 아래 가는 막대로만
     el.querySelector('i').style.width = `${Math.round(p * 100)}%`;
-    el.querySelector('span').textContent = `그래픽 불러오는 중 ${Math.round(p * 100)}%`;
+    el.querySelector('span').textContent = `${Math.round(p * 100)}%`;
     if (p >= 1 && failed.length) {
-      this.notice(`일부 그래픽(${failed.length}개)을 불러오지 못해 기본 그래픽으로 보여 줍니다.`);
+      this.notice("Some graphics didn't load.");
       setTimeout(() => this.notice(''), 5000);
     }
   }
 
+  // 17차 U2: 공개판에서는 숨김(개발 모드이거나 주소에 ?fps=1 일 때만 — game.js 가 show 를 정함)
   setFps(fps, show = true) {
     this.fpsEl.textContent = show ? `${fps} FPS` : '';
   }
@@ -573,7 +763,8 @@ export class UI {
       this.edgePool.push(d);
     }
     const W = window.innerWidth;
-    const H = window.innerHeight;
+    const H = this.view ? this.view.h : window.innerHeight;
+    const top = this.view ? this.view.top : 0;
     this.edgePool.forEach((d, i) => {
       const it = list[i];
       if (!it) {
@@ -582,7 +773,7 @@ export class UI {
       }
       d.style.display = 'block';
       const px = ((it.x + 1) / 2) * W;
-      const py = ((1 - it.y) / 2) * H;
+      const py = top + ((1 - it.y) / 2) * H;
       const c = it.color;
       const m = Math.max(c[0], c[1], c[2], 0.01);
       const rgb = `${Math.round((c[0] / m) * 255)},${Math.round((c[1] / m) * 255)},${Math.round((c[2] / m) * 255)}`;

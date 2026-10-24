@@ -8,6 +8,14 @@ import { CAMERA, FEEL, ROLL } from './config.js';
 
 const DEG = Math.PI / 180;
 
+// 16차 3-2: 세로 FOV = clamp(2·atan(tan(가로 반각 42°) / 가로세로비), 60, 66). 16:9 는 60(그대로), 4:3 은 66(가로 반각 40.9° ≥ los 40°)
+export function baseFov(aspect) {
+  const F = CAMERA.fit;
+  const a = Math.max(1e-3, aspect || 16 / 9);
+  const v = (2 * Math.atan(Math.tan(F.hHalf * DEG) / a)) / DEG;
+  return Math.min(F.max, Math.max(F.min, v));
+}
+
 export class CameraRig {
   constructor(camera) {
     this.camera = camera;
@@ -160,7 +168,7 @@ export class CameraRig {
     c.up.set(0, 1, 0);
     c.lookAt(this._look);
     if (this.roll || this.rollExtra) c.rotateZ(this.roll + (this.rollExtra || 0));
-    const fov = CAMERA.fov + (CAMERA.finaleFov - CAMERA.fov) * this.finale + this.kick;
+    const fov = baseFov(c.aspect) + (CAMERA.finaleFov - CAMERA.fov) * this.finale + this.kick;
     if (Math.abs(c.fov - fov) > 1e-3) {
       c.fov = fov;
       c.updateProjectionMatrix();
@@ -182,8 +190,8 @@ export class CameraRig {
     c.position.copy(this._p);
     c.up.set(0, 1, 0);
     c.lookAt(bird.pos);
-    if (Math.abs(c.fov - CAMERA.fov) > 1e-3) {
-      c.fov = CAMERA.fov;
+    if (Math.abs(c.fov - baseFov(c.aspect)) > 1e-3) {
+      c.fov = baseFov(c.aspect);
       c.updateProjectionMatrix();
     }
   }

@@ -32,7 +32,17 @@ export class Bird {
   }
 
   setSpecies(id) {
-    if (this.model) this.group.remove(this.model.root);
+    if (this.model) {
+      this.group.remove(this.model.root);
+      // 16차 U11(2-7 메모리): 판을 시작할 때마다 새 모델을 만들므로 옛 모델의 복제 기하·재질·뼈 텍스처(Skeleton boneTexture 8×8)를 놓아 준다.
+      // 공유하는 GLB 텍스처(map)는 재질 dispose 가 지우지 않는다. 안 하면 판마다 geometries·textures 가 1씩 늘었다
+      this.model.root.traverse((m) => {
+        if (m.isSkinnedMesh && m.skeleton) m.skeleton.dispose();
+        if (m.geometry) m.geometry.dispose();
+        const mats = Array.isArray(m.material) ? m.material : m.material ? [m.material] : [];
+        for (const mt of mats) mt.dispose();
+      });
+    }
     this.spec = BIRDS[id];
     this.model = createBirdModel(id);
     // 모델 몸길이 ≈ 1 → 맞는 범위(반지름)에 맞춰 키운다

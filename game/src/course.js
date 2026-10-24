@@ -2,7 +2,7 @@
 // 새·카메라·꽃문은 모두 「경로 좌표」(s 거리, u 좌우(오른쪽 +), v 세계 높이)로 다룬다. 통로 중심 높이 = center(s).
 // 방향각 th: 앞 = (sin th, 0, −cos th), 오른쪽 = (cos th, 0, sin th). th = 0 이면 −Z 로 난다(시작 장면과 같은 방향).
 // 시간 기준(4·5차 `s0 + t * forward`)을 없앴다 — 코스 모양·다리·협곡·옥상은 새 속도와 상관없이 세계에 고정된다.
-import { COURSE } from './config.js';
+import { STAGES } from './config.js';
 
 const DEG = Math.PI / 180;
 
@@ -115,14 +115,17 @@ export class Path2D {
 
 export class Course extends Path2D {
   // forward: 그 새의 전진 속도(시각 ↔ 거리 변환용으로만 쓴다)
+  // 16차 U6a: 코스 모양은 그 스테이지 코스 정의(stage.course = this.def)에서 읽는다
   constructor(stage, forward, s0 = 0) {
-    super(COURSE.plan, { x: 0, z: COURSE.pre, th: 0 }, -COURSE.pre, 1);
+    const D = (stage && stage.course) || STAGES[0].course;
+    super(D.plan, { x: 0, z: D.pre, th: 0 }, -D.pre, 1);
+    this.def = D;
     this.stage = stage;
     this.f = forward;
     this.s0 = s0;
-    this.length = COURSE.length;
-    this.E = COURSE.ellipse;
-    const H = COURSE.height;
+    this.length = D.length;
+    this.E = D.ellipse;
+    const H = D.height;
     this.H = new Float64Array(this.n);
     this.SL = new Float64Array(this.n); // 경사(dv/ds)
     for (let i = 0; i < this.n; i++) this.H[i] = Course._h(H, this.sMin + i * this.ds);
@@ -132,7 +135,7 @@ export class Course extends Path2D {
     }
     this.colliders = []; // 6차: 통로 안에 들어오는 구조물이 없다(다리 상판은 통로 위)
     this.structRanges = [];
-    this.bridges = COURSE.bridges.map((b) => ({ ...b }));
+    this.bridges = (D.bridges || []).map((b) => ({ ...b }));
   }
 
   static _h(H, s) {
@@ -185,8 +188,19 @@ export class Course extends Path2D {
 
   // 구간(환경) 정보
   zoneAt(s) {
-    for (const z of COURSE.zones) if (s >= z.s[0] && s < z.s[1]) return z;
-    return s < 0 ? COURSE.zones[0] : COURSE.zones[COURSE.zones.length - 1];
+    const Z = this.def.zones;
+    for (const z of Z) if (s >= z.s[0] && s < z.s[1]) return z;
+    return s < 0 ? Z[0] : Z[Z.length - 1];
+  }
+
+  // 16차 U6a: 구간(밖이면 null — game 의 쉬는 구간 보충용) · 구간(밖이면 마지막 — 안무·감독용, 옛 Director.zoneAt 과 같음)
+  zoneIn(s) {
+    for (const z of this.def.zones) if (s >= z.s[0] && s < z.s[1]) return z;
+    return null;
+  }
+
+  zoneOr(s) {
+    return this.zoneIn(s) || this.def.zones[this.def.zones.length - 1];
   }
 
   isOpen() {

@@ -3,7 +3,7 @@
 // - 가려짐 검사: 폭발 3.0초 전부터 예상 카메라에서 알까지 화면 안이고 건물(지도 칸 높이)에 가리지 않는가.
 // - 장식 불꽃: 거리대마다 초당 발수, 쉬는 구간에 더 자주. 웨이브 발사 때 장식 한 발을 0.5초 안에 함께 쏜다(「한 쇼」).
 import * as THREE from 'three';
-import { DECOR, CHOREO, COURSE, CAMERA, OMEN, BURST } from './config.js';
+import { DECOR, CHOREO, CAMERA, OMEN, BURST } from './config.js';
 import { planStage } from './choreo.js';
 
 export class Director {
@@ -19,16 +19,18 @@ export class Director {
     this.s0 = course.s0;
     this.events = [];
     this.doors = this.events;
-    this.duration = (COURSE.length - course.s0) / this.f;
+    this.duration = (course.length - course.s0) / this.f; // 16차 U6a: 그 스테이지 코스 길이
     this.plan = null;
   }
 
   // 플레이 시작: sStart = 그때 새의 경로 거리(시작 장면이 끝난 실제 자리)
   begin(sStart, world, seed, startW = -1) {
     this.s0 = sStart;
-    this.duration = (COURSE.length - sStart) / this.f;
+    this.duration = (this.course.length - sStart) / this.f;
     const los = world && world.occ ? (w) => this._los(w, world) : null;
-    this.plan = planStage(this.birdId, { seed, sStart, los, startW });
+    // 16차 U6a: 구간·길이는 코스 정의, 간격·알 수·D 목표·종류 비율은 그 스테이지 값(S1 은 옛 CHOREO·BURST.mix 그대로)
+    const st = this.stage || {};
+    this.plan = planStage(this.birdId, { seed, sStart, los, startW, course: this.course.def, choreo: st.choreo, mix: st.mix });
     this.events = this.plan.waves.map((w) => ({ ...w, type: w.pat, meetE: w.tPass, passE: w.tPass, finale: w.kind === 'finale' }));
     this.doors = this.events;
     return this.plan;
@@ -88,9 +90,8 @@ export class Director {
     return false;
   }
 
-  static zoneAt(s) {
-    for (const z of COURSE.zones) if (s >= z.s[0] && s < z.s[1]) return z;
-    return COURSE.zones[COURSE.zones.length - 1];
+  zoneAt(s) {
+    return this.course.zoneOr(s); // 16차 U6a: 그 스테이지 구간(밖이면 마지막 구간)
   }
 
   sAt(elapsed) {
@@ -98,12 +99,12 @@ export class Director {
   }
 
   sectionAt(elapsed) {
-    const z = Director.zoneAt(this.sAt(elapsed));
+    const z = this.zoneAt(this.sAt(elapsed));
     return { name: z.id, level: z.music, rest: !!z.rest, noSlowmo: z.id === 'finale', muffle: false, zone: z };
   }
 
   phase(elapsed) {
-    const z = Director.zoneAt(this.sAt(elapsed));
+    const z = this.zoneAt(this.sAt(elapsed));
     return z.id === 'finale' ? 2 : z.music >= 2 ? 1 : 0;
   }
 

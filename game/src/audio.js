@@ -100,6 +100,14 @@ export class Sound {
     if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
   }
 
+  // 16차 3-3: 터치·키 처리 안에서 동기로 — 멈춰 있거나(suspended) iOS 가 끊었으면(interrupted) 다시 켠다
+  unlock() {
+    const c = this.ctx;
+    if (c && c.state !== 'running' && c.state !== 'closed') {
+      try { c.resume(); } catch { /* 다음 터치에서 다시 */ }
+    }
+  }
+
   setMurmur(level) {
     if (!this.ctx) return;
     this.murmur.gain.setTargetAtTime(level * 0.06, this.ctx.currentTime, 0.4);

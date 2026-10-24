@@ -6,8 +6,8 @@
 import * as THREE from 'three';
 import {
   BIRDS, BIRD_ORDER, STAGES, PLAYABLE, SCORING, HEAL_BETWEEN_STAGES, DAMAGE, CAMERA, RENDER, INTRO, FALL,
-  ENDING_JOKES, ENDING_FACT, VICTORY_LINE, RANKING, FIREWORK_TYPES, LIGHTS, SAFETY, DECOR,
-  ROLL, FEEL, BEAT, MUSIC, COURSE, BURST, FOOD, OMEN, TIMING,
+  ENDING_CORE, FALL_LINES, CLEAR_LINES, RANKING, FIREWORK_TYPES, LIGHTS, SAFETY, DECOR,
+  ROLL, FEEL, BEAT, MUSIC, BURST, FOOD, OMEN, TIMING,
 } from './config.js';
 import { FLAG_FLICKER } from './particles.js';
 import { World } from './world.js';
@@ -19,17 +19,21 @@ import { Music } from './music.js';
 import { Director } from './director.js';
 import * as Choreo from './choreo.js';
 import { Bird } from './bird.js';
-import { CameraRig } from './camera.js';
+import { CameraRig, baseFov } from './camera.js';
 import { Course, boxDist, insideBox, segHitsBox } from './course.js';
 import { FlashLimiter } from './safety.js';
 import { FlashLights } from './lights.js';
 import { createRoastChicken, poseBird } from './models.js';
-import { normalizeNickname, filterTab, rankingStore } from './ranking.js';
+import { normalizeNickname, rankingStore, tabList, defaultTab } from './ranking.js';
+import { stageScore, newRun, onStageStart, onStageClear, onFallRetry, buildSubmission, runTotal } from './run.js';
 import { formatTime } from './ui.js';
-import { saveSettings } from './settings.js';
+import { saveSettings, userSetLowSpec } from './settings.js';
+import { progressStore } from './progress.js';
 
 // 개발 모드(npm.cmd run dev)에서만 켜진다. 공개 빌드에서는 false 로 바뀌어 빠진다.
 const DEV = !!(import.meta.env && import.meta.env.DEV);
+// 17차 U2: FPS 표시는 개발 모드이거나 주소에 ?fps=1 일 때만
+const SHOW_FPS = DEV || (typeof location !== 'undefined' && new URLSearchParams(location.search).get('fps') === '1');
 
 const BURST_SIZE = { finale: 1.4, chrysanthemum: 1, willow: 0.9, ring: 0.8, peony: 0.7 };
 const MUSICLOOK = MUSIC.lookahead;
@@ -38,28 +42,29 @@ const FLAG_FLICKER_FX = FLAG_FLICKER;
 const GPU_KEY = 'bvf.gpuNoticeClosed';
 const MENU_FORWARD = 13; // 메뉴 배경에서 쓰는 경로(가운데 새 속도)
 
-export function stageScore(stageId, rec) {
-  return (
-    SCORING.clearPerStage * stageId +
-    (rec.bonus ?? 0) +
-    SCORING.hpPoint * Math.ceil(Math.max(0, rec.hpEnd)) +
-    (rec.hits === 0 ? SCORING.noHitBonus : 0)
-  );
-}
+export { stageScore }; // 16차: run.js 로 옮김(옛 import 경로 유지)
+const LAST_NAME_KEY = 'bvf.lastName';
+const TAB_IDS = STAGES.map((s) => String(s.id)); // 16차 4-6: TOP 10 스테이지 탭 S1~S5
+const CLEAR_CRUISE = 3; // 2-6: 스테이지 끝 3초 순항 뒤 STAGE CLEAR 카드
+const CLEAR_AUTO = 8; // 카드가 뜬 뒤 8초면 NEXT 자동
+const FADE_MS = 600; // 0.6초 동안 검게
 
 export class Game {
-  constructor({ renderer, input, sound, ui, settings, touch = false, store = rankingStore }) {
+  constructor({ renderer, input, sound, ui, settings, touch = false, mobile = false, store = rankingStore, progress = progressStore }) {
     this.renderer = renderer;
     this.input = input;
     this.sound = sound;
     this.ui = ui;
     this.settings = settings;
     this.touch = touch;
+    this.mobile = mobile; // 16차 3-4: 터치 기기 저사양 프로필(시작 때 정함)
     this.store = store;
+    this.progress = progress; // 16차 2-6: 잠금 해제 진행(bvf.progress.v1)
+    this.selStage = 1; // 고르기 화면 스테이지 칩(1 = FULL RUN, 2~5 = PRACTICE)
 
     this.scene = new THREE.Scene();
     const aspect = renderer ? renderer.width / renderer.height : 16 / 9;
-    this.camera = new THREE.PerspectiveCamera(CAMERA.fov, aspect, CAMERA.near, 2200);
+    this.camera = new THREE.PerspectiveCamera(baseFov(aspect), aspect, CAMERA.near, mobile ? RENDER.mobile.far : 2200); // 16차: 4:3 FOV 보정, 모바일 far 1100
     this.lights = new FlashLights(this.scene); // 폭발 순간광(동시 4개 이하)
     this.world = new World(this.scene, this.lights);
     this.crowd = new Crowd(this.scene, this.world.shared);
@@ -92,7 +97,7 @@ export class Game {
       });
     }
     // 시작 장면에서 「날아갈 방향」 하늘을 미리 채울 때 쓰는 보조 카메라(−Z 를 봄)
-    this.aheadCam = new THREE.PerspectiveCamera(CAMERA.fov, aspect, 0.2, 2000);
+    this.aheadCam = new THREE.PerspectiveCamera(baseFov(aspect), aspect, 0.2, 2000);
 
     this.flashLimiter = new FlashLimiter();
     this.popClock = 0;
@@ -105,7 +110,7 @@ export class Game {
     this.god = false;
     this.paused = false;
     this.selected = 'sparrow';
-    this.rankTab = 'clean';
+    this.rankTab = null; // 16차: TOP 10 탭 { tab: 'full' | '1', sub } — null 이면 기본 탭(FULL RUN 에 기록이 있으면 FULL RUN, 없으면 S1)
     this.fps = 60;
     this._fpsAcc = 0;
     this._fpsN = 0;
@@ -149,7 +154,7 @@ export class Game {
     }
     this.endCam = new THREE.PerspectiveCamera(45, aspect, 0.1, 100);
     this.endCam.position.set(0, 2.3, 5.6);
-    this.endCam.lookAt(0, 0.45, 0);
+    this.endCam.lookAt(0, -0.75, 0); // 15차: 통닭을 화면 위쪽 절반에(아래는 글 판)
 
     this.cruiser = { s: 0, u: 0, v: 22, vx: 0, vy: 0, roll: 0, radius: 0.5, forward: 9, pos: new THREE.Vector3() };
     this.fw.onBurst = (hz) => this._onBurst(hz);
@@ -160,7 +165,7 @@ export class Game {
 
     this.devFreeze = false;
     if (DEV) {
-      ui.setDev('DEV · N 스테이지 건너뛰기 · G 무적 · B 판정 띠');
+      ui.setDev('DEV · N skip stage · G god mode · B hit bands');
       if (typeof window !== 'undefined') window.__bvf = this;
     }
     this.enterTitle();
@@ -182,6 +187,10 @@ export class Game {
     this.threats.setLowSpec(low, RENDER.lowSpecParticleMult);
     this.world.setLowSpec(low);
     if (this.director) this.director.lowSpec = low;
+    // 16차 3-4: 모바일 프로필 — 장식 불꽃 거리대마다 2, 먼 배경은 far 안으로
+    this.fw.decorMax = this.mobile ? RENDER.mobile.decorMax : Infinity;
+    if (this.world.setFar) this.world.setFar(this.mobile ? RENDER.mobile.far : 2200);
+    this.crowd.view = this.world.nearView || null;
   }
 
   // 외부 에셋(외벽·연기·간판 폰트)을 다 읽은 뒤 한 번
@@ -208,19 +217,26 @@ export class Game {
     this.stage = st;
     this.currentStageIndex = i;
     this.currentForward = forward;
-    this.s0 = forward * INTRO.rise * 0.5; // 시작 장면에서 날아오르며 간 거리
+    // 시작 장면에서 날아오르며 간 거리(16차 U6a: 스테이지 intro 정의 — 잠든 새 장면이면 전진 × 떠오름 × 0.5, 아니면 intro.s0)
+    this.s0 = st.intro && st.intro.s0 !== undefined ? st.intro.s0 : forward * INTRO.rise * 0.5;
     this.course = new Course(st, forward, this.s0);
     this.world.build(st, this.course);
-    this.crowd.build(this.world.crowdSpots, this.world.crowdGroundY, Math.round(st.crowd * (this.settings.lowSpec ? 0.6 : 1)));
+    this.crowd.build(this.world.crowdSpots, this.world.crowdGroundY, Math.round(st.city.crowd * (this.mobile ? RENDER.mobile.crowdMult : this.settings.lowSpec ? 0.6 : 1)), this.world.crowdY);
+    this.crowd.R = st.city.crowdR || 280; // 16차 U10
+    this.crowd._last = null;
     this.fw.reset();
     this.fw.setStage(st);
+    if (this.mobile) { // 16차 3-4: 안개 ×1.3(far 1100 안에서 끝이 보이지 않게)
+      this.world.fog.density *= RENDER.mobile.fogMult;
+      this.world.shared.uFogDensity.value *= RENDER.mobile.fogMult;
+    }
     this.threats.setStage(st, this.course, this.world);
     this.threats.shadowOn = false;
     this.bird.setCourse(this.course);
     this.rig.setCourse(this.course);
     this.rig.finale = 0;
     for (const b of this.course.colliders) b.fade = 1;
-    const glow = new THREE.Color(st.cityGlow);
+    const glow = new THREE.Color(st.city.cityGlow);
     this.fw.smokeTint = [glow.r * 0.55 + 0.035, glow.g * 0.5 + 0.035, glow.b * 0.45 + 0.045]; // 5차 B7: 연막이 도시광을 받아 번진다
     this.lights.clear();
   }
@@ -233,7 +249,7 @@ export class Game {
     const c = this.cruiser;
     c.s = 0;
     c.u = 0;
-    c.v = 22;
+    c.v = this.course.center(0) + 4; // 15차: 메뉴 순항 높이도 통로 중심을 따른다
     this.rig.reset(c);
     this.decorAcc = 0;
   }
@@ -252,14 +268,75 @@ export class Game {
     this.threats.reset();
     this.food.reset();
     this._resetCruiser();
-    let top = [];
-    try {
-      top = filterTab(await this.store.list(), 'clean').slice(0, 10);
-    } catch {
-      top = [];
+    // 15차 C-2: 전체 화면 타이틀. 연출은 이 페이지를 연 뒤 처음 한 번(새로고침하면 다시), 일시정지 Quit 으로 오면 마지막 장면 그대로
+    const animate = !this._titleShown;
+    this._titleShown = true;
+    this.titleT = animate ? 0 : 99;
+    this._titleBoom = !animate;
+    this.ui.showTitle({ settings: this.settings, touch: this.touch, gpuWarn: this._gpuWarnVisible(), animate, reduceMotion: !!this.settings.reduceMotion });
+  }
+
+  // 15차 타이틀 연출: 0.6초 가운데 뒤로 발사 꼬리 하나 → 1.2초 제목 뒤에서 금색 국화 한 발(장식 불꽃, HDR 1.4 이하, 번쩍임 제한 안)
+  _titleShow(dt) {
+    this.titleT += dt;
+    if (!this._titleBoom && this.titleT >= 0.05) {
+      this._titleBoom = true;
+      const cam = this.camera;
+      cam.updateMatrixWorld();
+      const f = new THREE.Vector3();
+      cam.getWorldDirection(f);
+      f.y = 0;
+      f.normalize();
+      const p = cam.position.clone().addScaledVector(f, 150);
+      p.y = cam.position.y + 34;
+      const lp = p.clone();
+      lp.y = Math.max(0.6, this.world.surfaceY ? this.world.surfaceY(lp.x, lp.z) + 0.4 : 0.6);
+      this.fw._schedule('chrysanthemum', FIREWORK_TYPES.chrysanthemum, p, this.t + 1.2 - this.titleT, [1.35, 0.82, 0.28], this.world, { launchPos: lp, flight: 0.6, visR: 24, size: 1.2, particles: 520, life: 2.6 });
     }
-    if (this.state !== 'title') return;
-    this.ui.showTitle({ settings: this.settings, touch: this.touch, top, dev: DEV, gpuWarn: this._gpuWarnVisible() });
+  }
+
+  // 새 고르기 화면 다시 그리기(TOP 10 펼침·톱니 옵션 상태 유지)
+  _showSelect() {
+    const view = this._rankView || null;
+    const rt = this._tabState();
+    const top = tabList(view, rt.tab, rt.sub);
+    const best = view ? Math.max(0, ...view.runs.map((e) => e.score), ...view.stages['1'].filter((e) => e.mode === 'run').map((e) => e.score)) : 0;
+    if (!this._stageOk(this.selStage)) this.selStage = 1;
+    const stages = STAGES.map((s) => ({ id: s.id, name: s.name, playable: !!s.playable, unlocked: this._unlocked(s.id) }));
+    this.ui.showSelect({ selected: this.selected, best, top: top.slice(0, 10), tabs: rt, settings: this.settings, showTop: !!this.selTop, showOpts: !!this.selOpts, stages, selStage: this.selStage });
+  }
+
+  // 16차 2-6: 스테이지 n 이 열렸는가(DEV 는 모두) · 고를 수 있는가(열림 + 만들어진 스테이지)
+  _unlocked(n) {
+    return this.progress.unlocked(n, DEV);
+  }
+
+  _stageOk(n) {
+    const s = STAGES[n - 1];
+    return !!s && !!s.playable && this._unlocked(n);
+  }
+
+  // 16차: TOP 10 탭 상태(FULL RUN: NO RETRY 기본 / ALL · S1: RUN 기본 / PRACTICE)
+  _tabState() {
+    if (!this.rankTab) {
+      const tab = defaultTab(this._rankView);
+      return { tab, sub: tab === 'full' ? 'clean' : 'run' };
+    }
+    return this.rankTab;
+  }
+
+  _setRankTab(tab, sub) {
+    const t = tab === 'full' ? 'full' : TAB_IDS.includes(String(tab)) ? String(tab) : '1'; // 16차 U6b: S1~S5
+    const s = t === 'full' ? (sub === 'all' ? 'all' : 'clean') : sub === 'practice' ? 'practice' : 'run';
+    this.rankTab = { tab: t, sub: s };
+  }
+
+  async _loadTop() {
+    try {
+      this._rankView = await this.store.list();
+    } catch {
+      this._rankView = null;
+    }
   }
 
   _gpuWarnVisible() {
@@ -289,22 +366,41 @@ export class Game {
     this.bird.reset(BIRDS[this.selected].hp, this.cruiser.v, this.cruiser.s);
     this.bird.group.visible = true;
     this.selectAngle = 0.6;
-    this.ui.showSelect({ selected: this.selected });
+    this.selTop = false;
+    this.selOpts = false;
+    this._showSelect();
+    this._loadTop().then(() => { if (this.state === 'select') this._showSelect(); });
   }
 
   startRun() {
-    this.run = { bird: this.selected, stageIndex: 0, continues: 0, records: [], totalTime: 0, registered: false };
+    this.run = newRun(this.selected, 'run', 1); // 16차: run.js(전체 판, S1 부터)
     this.bird.setSpecies(this.selected);
     this.startStage(0, BIRDS[this.selected].hp, true);
   }
 
-  startStage(i, hp, withIntro) {
-    this.run.stageIndex = i;
-    this.run.stageStartHp = hp;
+  // 16차 2-6: 연습 = 그 스테이지 하나만, HP 가득, 스테이지 기록만
+  startPractice(n) {
+    this.run = newRun(this.selected, 'practice', n);
+    this.bird.setSpecies(this.selected);
+    this.startStage(n - 1, BIRDS[this.selected].hp, true);
+  }
+
+  // withIntro: S1 은 잠든 새 장면, S2~S5 는 1.5초 날아드는 장면(intro.flyIn). rolls: 시작 롤 개수(없으면 기본 3)
+  startStage(i, hp, withIntro, rolls = null) {
+    onStageStart(this.run, i, hp);
     this._useStage(i, BIRDS[this.selected].forward);
     this.director = new Director(this.stage, this.course, this.bird, this.settings.lowSpec, this.scriptOpts);
     this.stageDur = this.director.duration;
-    this.bird.reset(hp, this._startV(), withIntro ? 0 : this.s0);
+    // 15차: 시작 장면은 다리 A 트러스 윗현 위에서 잠든 새(기둥·전깃줄 횃대 없음)
+    const A = this.world.bridgeA;
+    const perchS = A ? this.course.nearest(0, A.perchZ).s : 0;
+    const IN = this.stage.intro || {};
+    const flyIn = withIntro && !IN.sleep ? IN.flyIn || 1.5 : 0;
+    if (withIntro && IN.sleep && A) this.bird.reset(hp, A.perchY + BIRDS[this.selected].radius * 0.85, perchS);
+    else if (flyIn) this.bird.reset(hp, this._startV(), this.s0 - BIRDS[this.selected].forward * flyIn); // 날아드는 장면: s0 에 닿게 뒤에서 출발
+    else this.bird.reset(hp, this._startV(), withIntro ? 0 : this.s0);
+    if (rolls !== null && rolls !== undefined) this.bird.rolls = rolls; // 16차: 다음 스테이지·이어하기는 롤 개수를 이어 감
+    this._stageRolls = this.bird.rolls;
     this.bird.group.visible = true;
     this.stats = { nearMiss: 0, rings: 0, bonus: 0, chain: 0, hits: 0, elapsed: 0, phase: 0, obstacleHits: 0, perfect: 0, graze: 0, dodge: 0, maxChain: 0, rolls: 0, center: 0, centerMult: 0, pass: 0, timing: 0, food: 0, hpFood: 0, rollFood: 0, healed: 0 };
     this.music.stop();
@@ -329,17 +425,20 @@ export class Game {
     this.food.resetLog();
     this.food.build(this.course);
     this.resetMetrics();
-    if (withIntro) {
+    if (flyIn) {
+      this.state = 'flyin';
+      this.introT = 0;
+      this.flyInT = flyIn;
+      this.perch.visible = false;
+      this.ui.showHud(false);
+      this.ui.introText('');
+    } else if (withIntro) {
       this.state = 'intro';
       this.introT = 0;
       this.introBoom = false;
-      this.perch.visible = true;
-      this.perch.position.set(0, this.bird.pos.y - this.bird.radius * 0.85, 0);
-      const py = this.perch.position.y;
-      for (const p of this.poles) {
-        p.scale.y = py + 3;
-        p.position.y = -py + (py + 3) / 2;
-      }
+      this.perch.visible = false;
+      this.perchY = this.bird.pos.y - this.bird.radius * 0.85;
+      this.introY0 = null;
       this.ui.showHud(false);
       this.ui.introText('Z z z …');
     } else {
@@ -367,12 +466,17 @@ export class Game {
     if (typeof console !== 'undefined') console.info('[bvf seed]', JSON.stringify({ bird: this.bird.spec.id, ...this.planInfo }));
     this.ui.introText('');
     this.ui.showHud(true);
-    this.ui.banner(`STAGE ${this.stage.id}`, `${this.stage.name} · 약 ${Math.round(this.stageDur)}초 · 범위 원이 뜨면 1초 뒤 쾅! 원 밖으로 · 가운데 구멍으로`);
+    this.ui.banner(this.stage.name.toUpperCase(), `${this.stage.id} / ${STAGES.length}`); // 17차 U2: 「이름 / 2 / 5」
     this.rig.reset(this.bird);
     this.stats.elapsed = 0;
     this.realPlay = 0;
     this.music.start(() => this.stats.elapsed, (Tb) => this.director.sectionAt(Tb).level);
-    this.ui.hint('점선 원 = 불꽃이 터질 범위(그 안은 모두 위험) · 원 밖으로 / 가운데 구멍으로 · 하얀 작은 고리 = 내 새가 지날 자리');
+    this.ui.hint('Dodge the ring, or fly through the hole.');
+    // 16차 3-1: 터치 첫 플레이 4초 동안 손가락 그림
+    if (this.touch && !this._touchHinted && this.ui.touchHint) {
+      this._touchHinted = true;
+      this.ui.touchHint();
+    }
     // 개막 일제 발사: 시작하자마자 여러 거리에서 불꽃
     const op = DECOR.opening;
     for (let i = 0; i < op.count; i++) {
@@ -385,15 +489,12 @@ export class Game {
     const st = this.stage;
     const rec = { id: st.id, seed: this.runSeed, nearMiss: this.stats.nearMiss, perfect: this.stats.perfect, graze: this.stats.graze, maxChain: this.stats.maxChain, bonus: Math.round(this.stats.bonus), hits: this.stats.hits, hpEnd: Math.max(0, this.bird.hp) };
     rec.score = stageScore(st.id, rec);
-    this.run.records[this.run.stageIndex] = rec;
+    rec.rolls = this.bird.rolls;
+    // 16차: 기록·다음 HP(30% 회복)·롤(최소 3)은 run.js
+    onStageClear(this.run, rec, this.bird.maxHp);
     this.run.totalTime += this.stageDur || st.duration;
-    const isLast = this.run.stageIndex >= PLAYABLE - 1; // 4차: S2~S5 준비 중 → S1 이 마지막
-    const maxHp = this.bird.maxHp;
-    const hpBefore = this.bird.hp;
-    const hpAfter = Math.min(maxHp, hpBefore + maxHp * HEAL_BETWEEN_STAGES);
-    this.run.nextHp = hpAfter;
     this._logPerf();
-    this.state = 'interlude';
+    this.progress.markCleared(st.id); // 16차 2-6: 모드와 상관없이 깨면 다음 스테이지가 열린다
     this.music.stop();
     this.ui.hint('');
     this.ui.setEdges([]);
@@ -403,20 +504,72 @@ export class Game {
     this.threats.shadowOn = false;
     this.threats.reset();
     this.food.reset();
-    this.sound.cheer(0.7, 2.2);
     this.cruiser.s = this.bird.s;
     this.cruiser.u = this.bird.u;
     this.cruiser.v = this.bird.v;
-    this.ui.showInterlude({ stage: st, rec, hpBefore, hpAfter, maxHp, next: STAGES[this.run.stageIndex + 1], total: this.runTotal(), isLast });
+    // 16차 2-6: 전체 판은 3초 순항 → STAGE CLEAR 카드. 다음 스테이지가 있으면 [NEXT], 마지막 스테이지면 [SEE RESULTS](U11 — S5 보너스 내역을 보여 주려고)
+    // 연습은 결과 판
+    const next = STAGES[this.run.stageIndex + 1];
+    if (this.run.mode === 'run') this.enterStageClear(rec, next && next.playable ? this.run.stageIndex + 1 : null);
+    else this.enterVictory(rec);
+  }
+
+  enterStageClear(rec, nextIndex) {
+    this.state = 'stageclear';
+    this.endingT = 0;
+    this._clearRec = rec;
+    this._nextIndex = nextIndex;
+    this._cardShown = false;
+    this._transit = false;
+    this.crowd.setMaxCheer(1);
+    this.sound.cheer(0.9, 3);
+  }
+
+  _showStageClear() {
+    this._cardShown = true;
+    this._cardT = this.endingT;
+    const nx = this._nextIndex === null ? null : STAGES[this._nextIndex];
+    this.ui.showStageClear({ rec: this._clearRec, total: this.runTotal(), heal: HEAL_BETWEEN_STAGES, next: nx ? { id: nx.id, name: nx.name } : null });
+  }
+
+  // 16차 U11: 마지막 스테이지 카드의 [SEE RESULTS] → 결과 판(이름 입력)
+  _seeResults() {
+    if (this.state !== 'stageclear' || this._transit || this._nextIndex !== null) return;
+    this.enterVictory(this._clearRec);
+  }
+
+  // NEXT: 0.6초 동안 검게 → 월드 다시 짓기(「Loading STAGE n」 한 프레임 뒤) → 1.5초 날아드는 장면 → 배너
+  _nextStage() {
+    if (this.state !== 'stageclear' || this._transit) return;
+    this._transit = true;
+    const i = this._nextIndex;
+    this.ui.hideScreen();
+    this.ui.fade(true);
+    setTimeout(() => {
+      this._withLoading(() => {
+        this.startStage(i, this.run.nextHp, true, this.run.nextRolls);
+        this.ui.fade(false);
+      }, i + 1);
+    }, FADE_MS);
   }
 
   runTotal() {
-    return this.run ? this.run.records.reduce((a, r) => a + (r ? r.score : 0), 0) : 0;
+    return runTotal(this.run);
   }
 
-  nextFromInterlude() {
-    if (this.run.stageIndex >= PLAYABLE - 1) this.enterVictory();
-    else this.startStage(this.run.stageIndex + 1, this.run.nextHp, false);
+  // 15차 B: 변주 문구는 섞은 순서대로 하나씩(셔플 백) — 같은 문구가 연달아 나오지 않게
+  _bagPick(key, list) {
+    const bags = this._bags || (this._bags = {});
+    let b = bags[key];
+    if (!b || !b.left.length) {
+      const idx = list.map((_, i) => i);
+      for (let i = idx.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [idx[i], idx[j]] = [idx[j], idx[i]]; }
+      if (b && b.last !== undefined && idx[0] === b.last && idx.length > 1) [idx[0], idx[1]] = [idx[1], idx[0]];
+      b = bags[key] = { left: idx, last: b ? b.last : undefined };
+    }
+    const i = b.left.shift();
+    b.last = i;
+    return list[i];
   }
 
   startFall() {
@@ -446,100 +599,199 @@ export class Game {
     this.crowd.setMaxCheer(0);
     this.sound.setMurmur(0);
     const time = this.run.totalTime + this.stats.elapsed;
-    const joke = ENDING_JOKES[Math.floor(Math.random() * ENDING_JOKES.length)].replace('{time}', formatTime(time));
+    const joke = this._bagPick('fall', FALL_LINES);
     this.chicken.rotation.y = 0;
+    this.endingT = 0;
+    const s0 = this.s0 || 0;
+    const r = this.run;
     this.ui.showEnding({
-      joke, fact: ENDING_FACT, stage: this.stage, time,
+      // 16차 2-6: 전체 판 S1 은 TRY AGAIN(새 판), 그 밖은 CONTINUE STAGE n + START OVER. 전체 판 도중이면 「Save stage scores」(선택)
+      cont: !(r.mode === 'run' && r.stageIndex === 0), stageN: this.stage.id,
+      canSave: r.mode === 'run' && r.records.some(Boolean) && !r.stagesSaved,
+      joke, fact: ENDING_CORE, stage: this.stage, time,
+      progress: Math.max(0, Math.min(1, (this.bird.s - s0) / Math.max(1, this.course.length - s0))),
       hits: this.run.records.reduce((a, r) => a + (r ? r.hits : 0), 0) + this.stats.hits,
       score: this.runTotal() + Math.round(this.stats.bonus),
     });
   }
 
+  // 16차: 전체 판 S1 추락 뒤 TRY AGAIN = 새 판(이어하기 0, 15차까지는 여기서도 continues++ 를 하던 버그). 그 밖은 그 스테이지 시작 HP 로 이어하기 +1
   retryStage() {
-    this.run.continues++;
-    this.startStage(this.run.stageIndex, this.run.stageStartHp, false);
+    const r = onFallRetry(this.run);
+    if (r.newRun) {
+      this.run = newRun(this.selected, 'run', 1); // 새 판이지만 15차처럼 시작 장면 없이 바로
+      this.startStage(0, BIRDS[this.selected].hp, false);
+    } else {
+      this.startStage(this.run.stageIndex, r.hp, true, this._stageRolls); // 그 스테이지 시작 HP·롤로, S2~S5 는 날아드는 장면부터
+    }
   }
 
-  enterVictory() {
+  // 16차 2-6: START OVER — 전체 판은 S1 부터 새 판, 연습은 그 스테이지 새로
+  startOver() {
+    if (this.run && this.run.mode === 'practice') this.startPractice(this.run.startStage);
+    else this.startRun();
+  }
+
+  enterVictory(rec) {
     this.state = 'victory';
+    this.endingT = 0;
     this.ui.showHud(false);
     this.sound.cheer(0.9, 3);
     this.ui.showVictory({
-      line: VICTORY_LINE, fact: ENDING_FACT, total: this.runTotal(), records: this.run.records,
-      continues: this.run.continues, bird: this.run.bird, time: this.run.totalTime,
+      line: this._bagPick('clear', CLEAR_LINES), fact: ENDING_CORE, rec: rec || this.run.records[0] || {}, total: this.runTotal(),
+      bird: this.run.bird, time: this.run.totalTime,
     });
   }
 
+  // 16차 4-4: 두 번 저장 막기 — await 전에 동기로 registering 을 세운다. 제출 내용은 run.js buildSubmission
   async register(rawName) {
-    if (!this.run || this.run.registered) return;
+    if (this.state === 'ending') return this.saveStageScores(rawName); // 16차: 추락 판의 「Save stage scores」
+    const run = this.run;
+    if (!run || run.registered || run.registering) return;
     const n = normalizeNickname(rawName);
     if (!n.ok) {
       this.ui.setRegisterMessage(n.reason);
       return;
     }
-    const res = await this.store.submit({
-      name: n.name, norm: n.norm, score: this.runTotal(), bird: this.run.bird, continues: this.run.continues, ver: 6,
-      stages: this.run.records.map((r) => ({ id: r.id, score: r.score, nearMiss: r.nearMiss, hits: r.hits, hpEnd: Math.ceil(r.hpEnd) })),
-    });
-    if (!res.ok) {
-      this.ui.setRegisterMessage(res.reason || '저장하지 못했어요.');
+    run.registering = true;
+    let res;
+    try {
+      res = await this.store.submit(buildSubmission(run, n));
+    } catch {
+      res = { ok: false, reason: "Couldn't save." };
+    }
+    if (!res.ok && !res.memOnly) {
+      run.registering = false; // 저장 실패(이름 그대로 다시 시도 가능)
+      this.ui.setRegisterMessage(res.reason || "Couldn't save.");
       return;
     }
-    this.run.registered = true;
-    this.myEntryId = res.id;
-    this.rankTab = this.run.continues === 0 ? 'clean' : 'all';
-    this.showRanking('victory');
+    run.registered = true;
+    try { if (typeof localStorage !== 'undefined') localStorage.setItem(LAST_NAME_KEY, n.name); } catch { /* 이름 기억 못 해도 그만 */ }
+    const ids = res.ids || { run: null, stages: {} };
+    this._savedIds = new Set([ids.run, ...Object.values(ids.stages)].filter(Boolean));
+    // 그 자리 TOP 10: 전체 완주 기록이 있으면 FULL RUN, 없으면 마지막으로 깬 스테이지 탭(RUN / PRACTICE)
+    const lastStage = run.records.reduce((a, rr, i) => (rr ? i + 1 : a), run.startStage || 1);
+    this._setRankTab(ids.run ? 'full' : String(lastStage), ids.run ? (run.continues ? 'all' : 'clean') : run.mode);
+    const ranked = res.ranked || {};
+    const inTop = ids.run ? ranked.run : Object.values(ranked.stages || {}).some(Boolean);
+    let msg = 'Saved.';
+    if (res.memOnly) msg = res.reason || "Couldn't save.";
+    else if (res.duplicate) msg = 'Already saved.';
+    else if (!inTop) msg = ids.run ? 'Saved (outside top 100).' : 'Saved (outside top 50).';
+    this._savedMsg = { msg, ok: !!res.ok };
+    await this._showSavedTop();
   }
 
-  async showRanking(from) {
-    this.rankFrom = from;
-    let list = [];
-    try {
-      list = await this.store.list();
-    } catch {
-      list = [];
+  // 16차 4-6: 전체 판 도중 추락 — 지금까지 깬 스테이지 기록만 저장(선택). await 전에 동기로 막는다. 저장소가 runId + stage 중복을 거부
+  async saveStageScores(rawName) {
+    const run = this.run;
+    if (!run || run.stageSaving || run.stagesSaved) return;
+    const n = normalizeNickname(rawName);
+    if (!n.ok) {
+      this.ui.setRegisterMessage(n.reason);
+      return;
     }
-    const entries = filterTab(list, this.rankTab).slice(0, RANKING.show);
-    this.ui.showRanking({ entries, tab: this.rankTab, highlightId: this.myEntryId, from });
+    run.stageSaving = true;
+    let res;
+    try {
+      const sub = buildSubmission(run, n);
+      res = await this.store.submit({ run: null, stages: sub.stages });
+    } catch {
+      res = { ok: false, reason: "Couldn't save." };
+    }
+    run.stageSaving = false;
+    if (!res.ok && !res.memOnly) {
+      this.ui.setRegisterMessage(res.reason || "Couldn't save.");
+      return;
+    }
+    run.stagesSaved = true;
+    try { if (typeof localStorage !== 'undefined') localStorage.setItem(LAST_NAME_KEY, n.name); } catch { /* 이름 기억 못 해도 그만 */ }
+    const msg = res.memOnly ? res.reason || "Couldn't save." : res.duplicate ? 'Already saved.' : 'Saved.';
+    if (this.ui.stageScoresSaved) this.ui.stageScoresSaved(msg, !!res.ok);
+  }
+
+  async _showSavedTop() {
+    await this._loadTop();
+    const rt = this._tabState();
+    const list = tabList(this._rankView, rt.tab, rt.sub);
+    let top = list.slice(0, 10);
+    const mine = list.find((e) => this._savedIds && this._savedIds.has(e.id));
+    if (mine && !top.includes(mine)) top = [...top.slice(0, 9), mine];
+    this.ui.showSaved(top, this._savedIds, rt, this._savedMsg);
   }
 
   // ======================= UI 버튼 =======================
   onAction(act, data) {
     const s = this.sound;
     switch (act) {
+      case 'title-go':
+        if (this.state === 'title' && this.titleT > 0.3) this.onAction('start', {});
+        break;
       case 'start':
         s.start();
         s.setMuted(!this.settings.sound);
         this.enterSelect();
         break;
-      case 'ranking':
-        this.showRanking(this.state === 'victory' ? 'victory' : 'title');
+      case 'top':
+        this.selTop = !this.selTop;
+        this._showSelect();
         break;
-      case 'tab':
-        this.rankTab = data.tab === 'all' ? 'all' : 'clean';
-        this.showRanking(this.rankFrom);
+      case 'rank-tab': {
+        // 16차: TOP 10 탭(FULL RUN / S1)과 그 안의 거르기(NO RETRY·ALL / RUN·PRACTICE)
+        const cur = this._tabState();
+        const tab = data.tab || cur.tab;
+        this._setRankTab(tab, data.sub || (tab === cur.tab ? cur.sub : null));
+        if (this.state === 'select') this._showSelect();
+        else if (this.state === 'victory' && this.run && this.run.registered) this._showSavedTop();
         break;
-      case 'back':
-        this.enterTitle();
+      }
+      case 'gear':
+        this.selOpts = !this.selOpts;
+        this._showSelect();
         break;
       case 'pick':
         if (BIRDS[data.bird]) this._select(data.bird);
         break;
-      case 'locked':
-        this.ui.toast('준비 중인 스테이지예요. 지금은 STAGE 1 만 열려 있어요.');
-        break;
-      case 'fly':
+      case 'fly': {
         s.start();
-        this.startRun();
+        this._androidFullscreen();
+        const n = this._stageOk(this.selStage) ? this.selStage : 1;
+        this._withLoading(() => (n > 1 ? this.startPractice(n) : this.startRun()), n);
+        break;
+      }
+      case 'stage': {
+        // 16차 2-6: 스테이지 칩(1 = FULL RUN, 2~5 = PRACTICE). 잠긴 칩은 고를 수 없다
+        const n = Number(data.stage);
+        if (this.state === 'select' && this._stageOk(n)) { this.selStage = n; this._showSelect(); }
+        break;
+      }
+      case 'retry':
+        if (this.state !== 'ending') break;
+        this._withLoading(() => this.retryStage(), this.stage.id);
+        break;
+      case 'start-over':
+        this._withLoading(() => this.startOver(), this.run && this.run.mode === 'practice' ? this.run.startStage : 1);
         break;
       case 'next':
-        this.nextFromInterlude();
+        this._nextStage();
         break;
-      case 'retry':
-        this.retryStage();
+      case 'see-results':
+        this._seeResults();
+        break;
+      case 'clear-quit':
+        // 16차 2-6: 카드의 QUIT — 판을 여기서 끝내고 결과 판(지금까지 깬 스테이지 기록을 저장할 수 있게)
+        if (this.state === 'stageclear' && !this._transit) this.enterVictory(this._clearRec);
+        break;
+      case 'again':
+        s.start();
+        this._withLoading(() => this.startOver(), this.run && this.run.mode === 'practice' ? this.run.startStage : 1);
         break;
       case 'restart':
         this.enterSelect();
+        break;
+      case 'restart-run':
+        this.setPaused(false);
+        this._withLoading(() => this.startOver(), this.run && this.run.mode === 'practice' ? this.run.startStage : 1);
         break;
       case 'resume':
         this.setPaused(false);
@@ -556,7 +808,7 @@ export class Game {
         break;
       case 'gpu-copy': {
         const addr = 'chrome://settings/system';
-        const done = () => this.ui.toast('주소를 복사했어요. 크롬 주소창에 붙여넣으세요.');
+        const done = () => this.ui.toast('Copied.');
         try {
           if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(addr).then(done, () => this.ui.toast(addr));
           else this.ui.toast(addr);
@@ -578,15 +830,46 @@ export class Game {
     }
   }
 
+  // 16차 3-4: 월드를 다시 짓기 전에 「Loading STAGE n」 을 한 프레임 그린 뒤 setTimeout(0) 으로 한 번에(모바일에서 멈춘 화면 대신)
+  _withLoading(fn, n = 1) {
+    if (this._loadingBusy) return;
+    if (typeof requestAnimationFrame !== 'function' || !this.ui.stageLoading) { fn(); return; }
+    this._loadingBusy = true;
+    this.ui.stageLoading(`STAGE ${n}`);
+    requestAnimationFrame(() => setTimeout(() => {
+      try { fn(); } finally {
+        this._loadingBusy = false;
+        this.ui.stageLoading('');
+      }
+    }, 0));
+  }
+
+  // 16차 3-2: 안드로이드 터치는 FLY 를 누를 때 전체 화면 + 가로 고정을 시도(실패는 무시). iOS 는 세로 판 안내만
+  _androidFullscreen() {
+    if (!this.touch || typeof navigator === 'undefined' || !/Android/i.test(navigator.userAgent || '')) return;
+    const lock = () => {
+      try {
+        const o = typeof screen !== 'undefined' && screen.orientation;
+        if (o && o.lock) o.lock('landscape').catch(() => {});
+      } catch { /* 고정 못 해도 그만 */ }
+    };
+    try {
+      const el = document.documentElement;
+      const p = !document.fullscreenElement && el.requestFullscreen ? el.requestFullscreen({ navigationUI: 'hide' }) : null;
+      if (p && p.then) p.then(lock, () => {});
+      else lock();
+    } catch { /* 전체 화면 못 해도 그만 */ }
+  }
+
   _select(id) {
     this.selected = id;
     this.bird.setSpecies(id);
     this.bird.reset(BIRDS[id].hp, this.cruiser.v, this.cruiser.s);
-    this.ui.showSelect({ selected: id });
+    this._showSelect();
   }
-
   setOption(key, value) {
     if (!(key in this.settings)) return;
+    if (key === 'lowSpec') userSetLowSpec(); // 16차: 직접 바꾸면 그 값부터 저장
     this.settings[key] = !!value;
     saveSettings();
     if (key === 'sound') this.sound.setMuted(!value);
@@ -599,13 +882,14 @@ export class Game {
   setPaused(p) {
     if (p === this.paused) return;
     this.paused = p;
+    if (p && this.input && this.input.releaseStick) this.input.releaseStick(); // 16차: 멈추면 스틱 축 0
     if (p) this.sound.suspend();
     else this.sound.resume();
     this.ui.showPause(p, this.settings);
   }
 
   get pausable() {
-    return this.state === 'play' || this.state === 'intro' || this.state === 'falling';
+    return this.state === 'play' || this.state === 'intro' || this.state === 'flyin' || this.state === 'falling';
   }
 
   onHidden() {
@@ -622,12 +906,16 @@ export class Game {
       this.setOption('sound', on);
       const box = typeof document !== 'undefined' ? document.querySelector('input[data-opt="sound"]') : null;
       if (box) box.checked = on;
-      this.ui.toast(on ? '소리 켬' : '소리 끔');
+      this.ui.toast(on ? 'Sound on' : 'Sound off');
     }
+    // 16차 3-2: 터치 모드에서 플레이 중 세로가 되면 자동 일시정지 + 「가로로 돌리세요」 판(QUIT TO MENU)
+    const portrait = this.touch && typeof window !== 'undefined' && window.innerHeight > window.innerWidth;
+    if (portrait && this.pausable && !this.paused) this.setPaused(true);
+    if (this.ui.showRotate) this.ui.showRotate(portrait && this.pausable);
     if (this.pausable && input.consume('Escape', 'KeyP')) this.setPaused(!this.paused);
     if (DEV && input.consume('KeyG')) {
       this.god = !this.god;
-      this.ui.setDev(`DEV · N 스테이지 건너뛰기 · G 무적${this.god ? ' [무적 켜짐]' : ''} · B 판정 구`);
+      this.ui.setDev(`DEV · N skip stage · G god mode${this.god ? ' [ON]' : ''} · B hit bands`);
     }
     if (DEV && input.consume('KeyB')) this.threats.debug = !this.threats.debug;
     if (!this.paused && !this.devFreeze) this._tick(Math.min(dtReal, RENDER.maxDt));
@@ -715,28 +1003,69 @@ export class Game {
   }
 
   _countFps(dt) {
+    this._capSample(dt);
     this._fpsAcc += dt;
     this._fpsN++;
     if (this._fpsAcc >= 0.5) {
       this.fps = Math.round(this._fpsN / this._fpsAcc);
       this._fpsAcc = 0;
       this._fpsN = 0;
-      this.ui.setFps(this.fps);
+      this.ui.setFps(this.fps, SHOW_FPS);
       if (this.state === 'play') {
         const p = this.metrics.perf.fps;
         p[0] = Math.min(p[0], this.fps);
         p[1] = Math.max(p[1], this.fps);
       }
-      if (this.state === 'play' && !this.settings.lowSpec && this.fps < RENDER.lowFpsThreshold) {
-        this._lowFpsT += 0.5;
-        if (this._lowFpsT >= RENDER.lowFpsSeconds && !this._lowFpsTold) {
-          this._lowFpsTold = true;
-          this.ui.notice('화면이 버벅이면 Esc 로 멈춘 뒤 「저사양 모드」를 켜 보세요.');
-          setTimeout(() => this.ui.notice(''), 6000);
-        }
-      } else {
-        this._lowFpsT = 0;
+      this._resStep();
+    }
+  }
+
+  // 16차 3-4(L3) 해상도 조절기 하나: 메뉴 처음 2초 프레임 간격 중앙값 = 화면 주기(cap).
+  // 플레이 중 fps < 0.75 × cap 이 3초 → 배율 −0.1(최저 0.75), fps ≥ 0.95 × cap 이 5초 → +0.1(상한 1.0). 30Hz 기기(cap 31~35ms)는 fps 30 이면 내리지 않음.
+  // 옛 「느리면 Low Graphics 안내」는 배율이 0.75 이고 fps < 0.75 × cap 이 6초일 때만
+  _capSample(dt) {
+    const R = RENDER.res;
+    if (this.capMs || !(this.state === 'title' || this.state === 'select') || !(dt > 0 && dt < 0.25)) return;
+    const s = this._capS || (this._capS = { t: 0, list: [] });
+    s.t += dt;
+    s.list.push(dt * 1000);
+    if (s.t >= R.capSec && s.list.length >= 10) {
+      const a = s.list.slice().sort((x, y) => x - y);
+      this.capMs = a[Math.floor(a.length / 2)];
+      this._capS = null;
+    }
+  }
+
+  _resStep() {
+    const R = RENDER.res;
+    if (this.state !== 'play' || !this.renderer || !this.renderer.setScale) {
+      this._resLow = this._resHigh = this._lowFpsT = 0;
+      return;
+    }
+    const capMs = this.capMs || 1000 / 60;
+    const capFps = 1000 / capMs;
+    const lock30 = capMs >= R.lock30[0] && capMs <= R.lock30[1] && this.fps >= 29;
+    const slow = this.fps < R.downK * capFps && !lock30;
+    this._resLow = slow ? (this._resLow || 0) + 0.5 : 0;
+    this._resHigh = this.fps >= R.upK * capFps ? (this._resHigh || 0) + 0.5 : 0;
+    const sc = this.renderer.scale;
+    if (this._resLow >= R.downSec && sc > R.min + 1e-6) {
+      this.renderer.setScale(sc - R.step);
+      this._resLow = 0;
+    } else if (this._resHigh >= R.upSec && sc < R.max - 1e-6) {
+      this.renderer.setScale(sc + R.step);
+      this._resHigh = 0;
+    }
+    (this.resLog || (this.resLog = [])).length > 400 || this.resLog.push([+(this.stats ? this.stats.elapsed : 0).toFixed(1), this.fps, this.renderer.scale]);
+    if (slow && this.renderer.scale <= R.min + 1e-6 && !this.settings.lowSpec) {
+      this._lowFpsT += 0.5;
+      if (this._lowFpsT >= R.lowSec && !this._lowFpsTold) {
+        this._lowFpsTold = true;
+        this.ui.notice(this.touch ? 'Slow? Turn on Low Graphics (II).' : 'Slow? Turn on Low Graphics (Esc).'); // 17차 U2: 짧게. 터치는 오른쪽 위 II(일시정지) 버튼
+        setTimeout(() => this.ui.notice(''), 6000);
       }
+    } else {
+      this._lowFpsT = 0;
     }
   }
 
@@ -744,20 +1073,54 @@ export class Game {
     const input = this.input;
     switch (this.state) {
       case 'title':
-      case 'interlude':
+        this._cruise(dt, false);
+        this._titleShow(dt);
+        // 15차: 아무 키나(0.3초 이후) → 소리를 열고 새 고르기
+        if (this.titleT > 0.3 && input.pressed && input.pressed.size > 0) {
+          input.pressed.clear();
+          this.onAction('start', {});
+        }
+        break;
+      case 'stageclear':
+        this._cruise(dt, false);
+        this.endingT = (this.endingT || 0) + dt;
+        // 16차 2-6: 3초 순항 뒤 카드(Enter 를 누르면 바로). 카드에서는 Enter = NEXT, 8초 뒤 자동
+        if (!this._cardShown) {
+          if (this.endingT >= CLEAR_CRUISE || input.consume('Enter', 'NumpadEnter')) this._showStageClear();
+        } else if (this._nextIndex === null) {
+          // 마지막 스테이지 카드: Enter = SEE RESULTS(자동으로 넘기지 않음 — 보너스 내역을 읽게)
+          if (input.consume('Enter', 'NumpadEnter')) this._seeResults();
+        } else if (input.consume('Enter', 'NumpadEnter') || this.endingT - this._cardT >= CLEAR_AUTO) {
+          this._nextStage();
+        }
+        break;
       case 'victory':
         this._cruise(dt, false);
-        if (this.state === 'title' && input.consume('Enter')) this.onAction('start', {});
-        if (this.state === 'interlude' && input.consume('Enter', 'NumpadEnter')) this.nextFromInterlude();
+        this.endingT = (this.endingT || 0) + dt;
+        // 15차: 이름 칸에 커서가 있으면 Enter = SAVE(폼이 처리, 게임 키는 받지 않음). 저장 뒤나 칸 밖이면 Enter = PLAY AGAIN
+        if (input.consume('Enter', 'NumpadEnter')) this.onAction('again', {});
+        else if (this.ui.revealAll && input.pressed && input.pressed.size > 0) this.ui.revealAll();
         break;
       case 'select':
         this._cruise(dt, true);
         if (input.consume('ArrowLeft', 'KeyA')) this._select(BIRD_ORDER[(BIRD_ORDER.indexOf(this.selected) + 2) % 3]);
         if (input.consume('ArrowRight', 'KeyD')) this._select(BIRD_ORDER[(BIRD_ORDER.indexOf(this.selected) + 1) % 3]);
+        if (input.consume('Escape') && this.selTop) { this.selTop = false; this._showSelect(); }
         if (input.consume('Enter', 'NumpadEnter', 'Space')) this.onAction('fly', {});
+        // 16차 2-6: ↑↓ = 스테이지 칩(고를 수 있는 것만)
+        for (const [k, d] of [['ArrowUp', -1], ['ArrowDown', 1]]) {
+          if (!input.consume(k)) continue;
+          for (let q = 1; q <= STAGES.length; q++) {
+            const n = ((this.selStage - 1 + d * q + STAGES.length * 2) % STAGES.length) + 1;
+            if (this._stageOk(n)) { if (n !== this.selStage) { this.selStage = n; this._showSelect(); } break; }
+          }
+        }
         break;
       case 'intro':
         this._intro(dt);
+        break;
+      case 'flyin':
+        this._flyIn(dt);
         break;
       case 'play':
         this._play(dt, dr);
@@ -767,6 +1130,10 @@ export class Game {
         break;
       case 'ending':
         this._endingAnim(dt);
+        this.endingT = (this.endingT || 0) + dt;
+        // 15차: 추락 화면 Enter = TRY AGAIN, 다른 키는 문구를 바로 전부 보이게
+        if (input.consume('Enter', 'NumpadEnter')) this.onAction('retry', {});
+        else if (this.ui.revealAll && input.pressed && input.pressed.size > 0) this.ui.revealAll();
         break;
       default:
         break;
@@ -780,7 +1147,7 @@ export class Game {
     c.v = this.course.center(c.s) + 4;
     if (c.s > this.course.sMax - 200) c.s = 0;
     this.course.toWorld(c.s, c.u, c.v, c.pos);
-    this.decorAcc = (this.decorAcc || 0) + dt * (this.state === 'victory' ? DECOR.victoryRate : DECOR.titleRate);
+    this.decorAcc = (this.decorAcc || 0) + dt * (this.state === 'victory' || this.state === 'stageclear' ? DECOR.victoryRate : DECOR.titleRate);
     while (this.decorAcc >= 1) {
       this.decorAcc -= 1;
       this.fw.spawnDecorBand(DECOR.bands[Math.floor(Math.random() * 3)], this.t, this._ctx());
@@ -808,12 +1175,13 @@ export class Game {
       this.camera.position.set(c.pos.x + (rx * Math.sin(a) - fx * Math.cos(a)) * r, camY, c.pos.z + (rz * Math.sin(a) - fz * Math.cos(a)) * r);
       this.camera.up.set(0, 1, 0);
       this.camera.lookAt(c.pos.x, camY + 0.05 * r, c.pos.z);
-      if (this.camera.fov !== CAMERA.fov) {
-        this.camera.fov = CAMERA.fov;
+      const bf = baseFov(this.camera.aspect);
+      if (this.camera.fov !== bf) {
+        this.camera.fov = bf;
         this.camera.updateProjectionMatrix();
       }
     } else {
-      this.bird.group.visible = this.state === 'interlude' || this.state === 'victory';
+      this.bird.group.visible = this.state === 'interlude' || this.state === 'victory' || this.state === 'stageclear';
       if (this.bird.group.visible) {
         this.bird.s = c.s;
         this.bird.u = c.u;
@@ -853,6 +1221,9 @@ export class Game {
     if (this.input.consume('Enter', 'NumpadEnter', 'Space')) {
       this.perch.visible = false;
       b.model.head.rotation.x = 0;
+      // 16차 U12: 건너뛰면 떠오름이 끝난 높이(통로 중심 − 1, 끝까지 본 것과 같은 자리)에서 시작한다. U1 에서 통로를 +4m 올린 뒤로
+      // 트러스 위(통로 중심 − 11m)에서 바로 시작하면 안무의 시작 자리가 알 허용 범위(w −7.5 미만) 밖이라 모든 웨이브가 실패(위협 0)했다
+      b.pos.y = this.course.center(-b.pos.z) - 1;
       this.ui.introText('');
       this._beginPlay();
       return;
@@ -874,14 +1245,17 @@ export class Game {
       const k = (T - wake) / INTRO.startle;
       b.phase += 30 * dt;
       poseBird(b.model, b.phase, Math.max(0, 1 - k * 3), -0.2, 0);
-      b.pos.y = this.perch.position.y + b.radius * 0.85 + Math.sin(Math.min(1, k) * Math.PI) * 0.6 * s;
+      b.pos.y = this.perchY + b.radius * 0.85 + Math.sin(Math.min(1, k) * Math.PI) * 0.6 * s;
       camTarget.set(b.pos.x + 2.6 * s, b.pos.y + 0.5 * s, b.pos.z - 2.2 * s);
     } else {
       this.ui.introText('');
       b.model.head.rotation.x = 0;
       const k = Math.min(1, (T - rise) / INTRO.rise);
       b.pos.z -= b.forward * dt * k;
-      b.pos.y += 2.2 * dt;
+      // 15차: 트러스 위(약 27m)에서 통로 중심(35m)까지 INTRO.rise 동안 부드럽게 떠오른다
+      if (this.introY0 === null) this.introY0 = b.pos.y;
+      const yEnd = this.course.center(-b.pos.z) - 1;
+      b.pos.y = this.introY0 + (yEnd - this.introY0) * (k * k * (3 - 2 * k));
       b.animate(dt, 1.4);
       // 옆 모습 → 플레이 카메라 자리(경로 뒤 9m)로 부드럽게
       const side = new THREE.Vector3(b.pos.x + 2.6 * s, b.pos.y + 0.5 * s, b.pos.z - 2.2 * s);
@@ -900,8 +1274,9 @@ export class Game {
     }
     this.camera.up.set(0, 1, 0);
     this.camera.lookAt(look);
-    if (this.camera.fov !== CAMERA.fov) {
-      this.camera.fov = CAMERA.fov;
+    const bf = baseFov(this.camera.aspect);
+    if (this.camera.fov !== bf) {
+      this.camera.fov = bf;
       this.camera.updateProjectionMatrix();
     }
     this._introDecor(dt);
@@ -912,6 +1287,22 @@ export class Game {
       this.perch.visible = false;
       this._beginPlay();
     }
+  }
+
+  // 16차 2-6: S2~S5 시작 — 통로 중심에서 1.5초 동안 s0 까지 날아든다(조종 없음, 위협 없음). Enter·Space 는 바로 시작
+  _flyIn(dt) {
+    const b = this.bird;
+    this.introT += dt;
+    if (this.input.consume('Enter', 'NumpadEnter', 'Space') || this.introT >= this.flyInT) {
+      this._beginPlay();
+      return;
+    }
+    b.steer(dt, { x: 0, y: 0 }, this.course.section(b.s, this._sec || (this._sec = {})));
+    this.rig.update(dt, b, this.settings.reduceMotion, dt);
+    this.camera.updateMatrixWorld();
+    this.fw.update(dt, this.t);
+    this.world.update(b.s, this.camera, this.t, dt);
+    this.crowd.update(this.t, this.camera);
   }
 
   _play(dt, dr = dt) {
@@ -947,7 +1338,7 @@ export class Game {
       if (got) {
         this.ui.rollGain();
         if (this.sound.ready && this.sound.rollGain) this.sound.rollGain();
-        this.ui.pop(`롤 +${got} (${b.rolls}/${ROLL.max})`, 'roll');
+        this.ui.pop(`ROLL +${got}`, 'roll');
         this._pickFx('roll');
       }
       if (this.measureOn) this._ev('rollRefill', null, { e: this.stats.elapsed, got, zone: zNow.id });
@@ -960,7 +1351,8 @@ export class Game {
     const elapsed = this.stats.elapsed;
     const section = this.director.sectionAt(elapsed);
     // 피날레 직전: 카메라를 조금 뒤로 빼고 FOV +2°(FOV 변화는 롤 +3° 와 합쳐 5° 이하)
-    const fin = section.name === 'finale' || b.s > COURSE.zones.find((z) => z.id === 'finale').s[0] - 30;
+    const fz = this.course.def.zones.find((z) => z.id === 'finale');
+    const fin = section.name === 'finale' || (!!fz && b.s > fz.s[0] - 30);
     this.rig.finale += ((fin ? 1 : 0) - this.rig.finale) * Math.min(1, dt / 1.5);
     this.stats.phase = this.director.update(dt, {
       threats: this.threats, bird: b, now: this.t, elapsed,
@@ -1006,26 +1398,30 @@ export class Game {
       this.startFall();
       return;
     }
-    if (b.s >= COURSE.length) this.stageClear();
+    if (b.s >= this.course.length) this.stageClear();
   }
 
   // 10차: 경로 거리 s 의 코스 구간
   _zoneOf(s) {
-    for (const z of COURSE.zones) if (s >= z.s[0] && s < z.s[1]) return z;
-    return null;
+    return this.course.zoneIn(s); // 16차 U6a: 그 스테이지 구간
   }
 
   // 안내 한 줄: 첫 문들 동안만, 쉬는 박자에서 금색 잔불 안내
   _hints(section, elapsed) {
-    if (this.hintBar < 1 && elapsed > 6.5) {
+    // 15차: 처음 두 웨이브 동안만 한 줄씩(아래 가운데)
+    if (this.hintBar < 0.5 && elapsed > 8.3) {
+      this.hintBar = 0.5;
+      this.ui.hint('Dotted ring = you.');
+    }
+    if (this.hintBar < 1 && elapsed > 12.5) {
       this.hintBar = 1;
       this.ui.hint('');
     }
-    if (this.hintBar < 2 && section.rest && section.name === 'turn1') {
+    if (this.hintBar < 2 && section.rest) {
       this.hintBar = 2;
-      this.ui.hint('선회 중에는 쉬는 시간 · 낮게 날며 하루살이를 먹어 보세요');
+      this.ui.hint('Breather. Grab the bugs.');
     }
-    if (this.hintBar < 3 && section.name === 'avenue') {
+    if (this.hintBar === 2 && !section.rest) {
       this.hintBar = 3;
       this.ui.hint('');
     }
@@ -1100,7 +1496,7 @@ export class Game {
       const H = FOOD.hp;
       if (b.hp >= b.maxHp - 1e-6) {
         st.bonus += H.fullPts;
-        text = `HP 가득 +${H.fullPts}점`;
+        text = `FULL +${H.fullPts}`;
         kind = 'gold';
         this.ui.scoreFly(H.fullPts, 'hp');
         if (this.sound.ready && this.sound.coin) this.sound.coin();
@@ -1110,7 +1506,7 @@ export class Game {
         b.hp = Math.min(b.maxHp, b.hp + want);
         const got = Math.round(b.hp - before);
         st.healed += b.hp - before;
-        text = got < want ? `HP +${got} · 가득` : `HP +${got}`;
+        text = `+HP ${got}`;
         kind = 'hp';
         this.ui.hpFlash(before, b.hp, b.maxHp);
         if (this.sound.ready && this.sound.heal) this.sound.heal();
@@ -1119,13 +1515,13 @@ export class Game {
       st.rollFood = (st.rollFood || 0) + 1;
       const got = b.gainRoll(1);
       if (got) {
-        text = `롤 +1 (${b.rolls}/${ROLL.max})`;
+        text = 'ROLL +1';
         kind = 'roll';
         this.ui.rollGain();
         if (this.sound.ready && this.sound.rollGain) this.sound.rollGain();
       } else {
         st.bonus += FOOD.roll.fullPts;
-        text = `롤 가득 → +${FOOD.roll.fullPts}점`;
+        text = `FULL +${FOOD.roll.fullPts}`;
         kind = 'gold';
         this.ui.scoreFly(FOOD.roll.fullPts, 'roll');
         if (this.sound.ready && this.sound.coin) this.sound.coin();
@@ -1168,8 +1564,9 @@ export class Game {
     const v = this._popV || (this._popV = new THREE.Vector3());
     v.copy(this.bird.pos).project(this.camera);
     const W = typeof window !== 'undefined' ? window.innerWidth : 1920;
-    const H = typeof window !== 'undefined' ? window.innerHeight : 1080;
-    this.ui.updatePops(((v.x + 1) / 2) * W, ((1 - v.y) / 2) * H, this._judgingNow());
+    const H = this.renderer ? this.renderer.height : typeof window !== 'undefined' ? window.innerHeight : 1080; // 16차: 검은 띠가 있으면 3D 화면 자리
+    const top = this.renderer ? this.renderer.viewTop || 0 : 0;
+    this.ui.updatePops(((v.x + 1) / 2) * W, top + ((1 - v.y) / 2) * H, this._judgingNow());
   }
 
   // 손맛 효과: 날개 끝 시안 흔적(길이 = 콤보), 속도선, 피격 뒤 연기, 무거워짐 회복, 깃털 그을림
@@ -1297,7 +1694,7 @@ export class Game {
         this.stats.nearMiss++;
         this.stats.chain++;
         this.stats.maxChain = Math.max(this.stats.maxChain, this.stats.chain);
-        this.ui.judge(`롤 관통 퍼펙트! +${Math.round(pts)}`, 'perfect');
+        this.ui.judge(`PERFECT +${Math.round(pts)}`, 'perfect');
         this.ui.pulse(FEEL.vignette);
         if (this.sound.ready) {
           this.sound.chime(this.stats.chain - 1, this.music.audioTimeOf(this.music.nextSixteenth(), this._aheadFn));
@@ -1317,7 +1714,7 @@ export class Game {
         return;
       }
       case 'dodge':
-        this.ui.judge('롤 회피', 'dodge');
+        this.ui.judge('DODGED', 'dodge');
         return;
       case 'graze': {
         const pts = SCORING.graze * this._mult();
@@ -1326,7 +1723,7 @@ export class Game {
         this.stats.nearMiss++;
         this.stats.chain++;
         this.stats.maxChain = Math.max(this.stats.maxChain, this.stats.chain);
-        this.ui.judge(`스침 +${Math.round(pts)}`, 'graze');
+        this.ui.judge(`GRAZE +${Math.round(pts)}`, 'graze');
         if (this.sound.ready) {
           this.sound.whoosh(0.9);
           const e8 = Math.ceil(this.stats.elapsed / BEAT.eighth + 1e-6) * BEAT.eighth;
@@ -1347,7 +1744,7 @@ export class Game {
         else this.stats.center++;
         this.stats.chain++;
         this.stats.maxChain = Math.max(this.stats.maxChain, this.stats.chain);
-        this.ui.judge(`${gap ? '틈새 통과' : '센터'}! +${Math.round(pts)} · 배율 +${bonus}`, 'perfect');
+        this.ui.judge(`THROUGH +${Math.round(pts)}`, 'perfect');
         if (this.sound.ready) this.sound.chime(Math.min(14, this.stats.center + (this.stats.gap || 0) - 1), this.music.audioTimeOf(this.music.nextSixteenth(), this._aheadFn));
         this._trailBurst(gap ? 0.8 : 0.6);
         return;
@@ -1358,7 +1755,7 @@ export class Game {
         const pts = SCORING.timing * this._mult();
         this.stats.bonus += pts;
         this.stats.timing = (this.stats.timing || 0) + 1;
-        this.ui.judge(`타이밍 퍼펙트! +${Math.round(pts)}`, 'perfect');
+        this.ui.judge(`TIMING +${Math.round(pts)}`, 'perfect');
         if (this.sound.ready) this.sound.chime(Math.min(14, this.stats.timing - 1), this.music.audioTimeOf(this.music.nextSixteenth(), this._aheadFn));
         this._trailBurst(0.5);
         return;
@@ -1369,7 +1766,7 @@ export class Game {
         this.stats.pass = (this.stats.pass || 0) + 1;
         this.stats.chain++;
         this.stats.maxChain = Math.max(this.stats.maxChain, this.stats.chain);
-        this.ui.judge(`통과 +${Math.round(pts)}`, 'dodge');
+        this.ui.judge(`PASS +${Math.round(pts)}`, 'dodge');
         return;
       }
       case 'hit':
@@ -1428,7 +1825,7 @@ export class Game {
         this.stats.chain = 0;
         this.border = Math.min(1, this.border + 0.5);
         this.sound.hit();
-        this.ui.judge(`쿵! -${Math.round(DAMAGE.obstacle * b.damageMult)}`, 'hit');
+        this.ui.judge(`−${Math.round(DAMAGE.obstacle * b.damageMult)}`, 'hit');
       }
       b.obsInvuln = DAMAGE.obstacleInvuln;
       b.invuln = Math.max(b.invuln, DAMAGE.obstacleInvuln);
@@ -1474,7 +1871,7 @@ export class Game {
     }
     this.sound.zap();
     if (this.sound.ready) this.sound.muffle(BEAT.bar, 500, true);
-    this.ui.judge(`-${Math.round(amount)}`, 'hit');
+    this.ui.judge(`−${Math.round(amount)}`, 'hit');
     this.crowd.birdHit(this.t);
     this.ui.wow();
     this.sound.cheer(1, 2.4);
@@ -1739,8 +2136,15 @@ export class Game {
     const pr = this.renderer.pixelRatio;
     const vh = this.renderer.height * pr;
     const scale = vh / (2 * Math.tan(THREE.MathUtils.degToRad(cam.fov) / 2));
-    this.fw.setPointScale(scale, this.renderer.width * pr, vh);
-    this.threats.setPointScale(scale, this.renderer.width * pr, vh, RENDER.maxSparkPx * (vh / 1080));
+    if (this.mobile) {
+      // 16차 3-4(M9): 불씨·연기 최대 픽셀 절반, 위협 별 머리 화면 지름 3 CSS px·범위 원 선 1.5 CSS px 이상
+      const M = RENDER.mobile;
+      this.fw.setPointScale(scale, this.renderer.width * pr, vh, M.maxSparkPx, M.maxSmokePx);
+      this.threats.setPointScale(scale, this.renderer.width * pr, vh, M.maxSparkPx * (vh / 1080), { headMin: (M.headMinCss / 2) * pr, lineMin: Math.max(0.75, (M.lineMinCss / 2) * pr) });
+    } else {
+      this.fw.setPointScale(scale, this.renderer.width * pr, vh);
+      this.threats.setPointScale(scale, this.renderer.width * pr, vh, RENDER.maxSparkPx * (vh / 1080));
+    }
     const info = this.renderer.renderer.info;
     info.autoReset = false;
     info.reset();
